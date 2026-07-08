@@ -40,7 +40,10 @@ class TestPublicEndpoints:
 class TestProtectedEndpoints:
     def test_protected_route_200_in_dev_none(self, app_client):
         r = app_client.get("/objectives")
-        assert r.status_code == 501  # not implemented yet, but auth passes
+        assert r.status_code == 200
+        data = r.json()
+        assert "objectives" in data
+        assert "count" in data
 
     def test_metrics_endpoint(self, app_client):
         r = app_client.get("/metrics")
