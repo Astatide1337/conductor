@@ -48,7 +48,7 @@ AGENT_RUN_TRANSITIONS: dict[str, set[str]] = {
     "created": {"dispatched"},
     "dispatched": {"queued", "running", "failed", "cancelled"},
     "queued": {"running", "failed", "cancelled"},
-    "running": {"completed", "failed", "cancelled"},
+    "running": {"completed", "failed", "cancelled", "lost"},
     "completed": set(),
     "failed": set(),
     "cancelled": set(),

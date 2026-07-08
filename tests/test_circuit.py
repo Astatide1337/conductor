@@ -94,15 +94,15 @@ class TestConcurrencyBreaker:
 
 class TestRetryBreaker:
     def test_within_limit(self):
-        result = evaluate_retry_breaker(attempt_count=3, max_retries=3)
+        result = evaluate_retry_breaker(task_attempt_count=3, max_retries=3)
         assert result.tripped is False
 
     def test_exceeds_limit(self):
-        result = evaluate_retry_breaker(attempt_count=4, max_retries=3)
+        result = evaluate_retry_breaker(task_attempt_count=4, max_retries=3)
         assert result.tripped is True
 
     def test_first_attempt(self):
-        result = evaluate_retry_breaker(attempt_count=1, max_retries=3)
+        result = evaluate_retry_breaker(task_attempt_count=1, max_retries=3)
         assert result.tripped is False
 
 

@@ -22,7 +22,9 @@ from conductor.logging import (
 )
 from conductor.metrics import MetricsRegistry, get_metrics_registry, init_conductor_metrics
 from conductor.models import ObjectiveCreate, TaskCreate
+from conductor.policy import check_action, check_decision
 from conductor.storage import ConductorStorage
+from conductor.clients.agents_gateway import MockAgentsGatewayClient
 
 logger = get_logger()
 
@@ -222,8 +224,15 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         return {"tasks": tasks, "count": len(tasks)}
 
     @app.post("/tasks/{task_id}/dispatch")
-    async def dispatch_task(task_id: str, request: Request):
-        raise HTTPException(501, "dispatch not implemented — milestone 5")
+    async def dispatch_route(task_id: str, request: Request):
+        from conductor.dispatch import dispatch_task as do_dispatch
+        mock = MockAgentsGatewayClient()
+        mock.register_agent("code-validator", "Code Validator")
+        try:
+            result = do_dispatch(app.state.storage, mock, task_id)
+            return JSONResponse(result, status_code=200)
+        except Exception as e:
+            raise HTTPException(500, f"Dispatch failed: {e}")
 
     # ── Protected routes: Approvals ──────────────────────────────────────
 
