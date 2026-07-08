@@ -152,9 +152,14 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         obj = storage.get_objective(objective_id)
         if not obj:
             raise HTTPException(404, "Objective not found")
-        if obj["status"] not in ("active", "paused"):
+        if obj["status"] not in ("created", "active", "paused"):
             raise HTTPException(400, f"Cannot resume objective in '{obj['status']}' status")
-        updated = storage.update_objective_status(objective_id, "active")
+        if obj["status"] == "paused":
+            updated = storage.update_objective_status(objective_id, "active")
+        elif obj["status"] == "created":
+            updated = storage.update_objective_status(objective_id, "active")
+        else:
+            updated = obj  # already active
         emit(storage, "objective.resumed", f"Objective resumed", objective_id=objective_id, source="user")
         return {"objective": updated}
 
@@ -205,11 +210,52 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         agent_runs = []  # agent_runs not queryable by task_id yet
         return {"task": task, "agent_runs": agent_runs}
 
+    @app.get("/tasks")
+    async def list_tasks(
+        objective_id: str | None = None,
+        run_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ):
+        tasks = storage.list_tasks(objective_id=objective_id, run_id=run_id, status=status, limit=limit, offset=offset)
+        return {"tasks": tasks, "count": len(tasks)}
+
     @app.post("/tasks/{task_id}/dispatch")
     async def dispatch_task(task_id: str, request: Request):
         raise HTTPException(501, "dispatch not implemented — milestone 5")
 
-    # ── Protected routes: Events ────────────────────────────────────────
+    # ── Protected routes: Approvals ──────────────────────────────────────
+
+    @app.get("/approvals")
+    async def list_approvals(
+        objective_id: str | None = None,
+        run_id: str | None = None,
+        status: str = "pending",
+        limit: int = 50,
+    ):
+        approvals = storage.list_approvals(objective_id=objective_id, run_id=run_id, status=status, limit=limit)
+        return {"approvals": approvals, "count": len(approvals)}
+
+    @app.post("/approvals/{approval_id}/approve")
+    async def approve(approval_id: str, request: Request):
+        raise HTTPException(501, "approve endpoint — milestone 3")
+
+    @app.post("/approvals/{approval_id}/reject")
+    async def reject(approval_id: str, request: Request):
+        raise HTTPException(501, "reject endpoint — milestone 3")
+
+    # ── Protected routes: Reconciliation ─────────────────────────────────
+
+    @app.post("/reconcile")
+    async def reconcile(request: Request):
+        raise HTTPException(501, "reconcile not implemented — milestone 6")
+
+    # ── Protected routes: Dry run ────────────────────────────────────────
+
+    @app.post("/dry-run")
+    async def dry_run(request: Request):
+        raise HTTPException(501, "dry run not implemented — milestone 8")
 
     @app.get("/events")
     async def list_events(
