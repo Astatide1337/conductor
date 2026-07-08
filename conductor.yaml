@@ -1,0 +1,47 @@
+# Conductor default YAML config
+# Override with env vars (CONDUCTOR_* prefix) or CLI flags
+
+service:
+  host: "0.0.0.0"
+  port: 8093
+  mcp_path: "/mcp"
+
+auth:
+  mode: dev-none
+  internal_secret: ""
+  cloudflare_team_domain: ""
+  cloudflare_aud: ""
+
+storage:
+  sqlite_path: "./data/conductor.db"
+
+observability:
+  log_level: INFO
+  log_format: json
+  metrics_enabled: true
+
+agents_gateway:
+  url: "http://localhost:8092"
+  auth_mode: dev-none
+  internal_token: ""
+  timeout_seconds: 30
+
+skills_gateway:
+  url: "http://localhost:8091"
+  auth_mode: dev-none
+  internal_token: ""
+  timeout_seconds: 10
+
+circuit:
+  max_iterations_per_run: 50
+  max_cost_usd_per_run: 10.0
+  max_concurrent_tasks: 4
+  max_retries_per_task: 3
+  max_wall_clock_minutes: 120
+  max_stall_minutes: 30
+
+planner:
+  mode: manual
+  llm_provider: ""
+  llm_model: ""
+  llm_api_key: ""

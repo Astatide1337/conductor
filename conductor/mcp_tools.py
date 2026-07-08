@@ -1,0 +1,1 @@
+"""MCP cockpit tools — expose conductor as MCP surface. (Milestone 10)"""
