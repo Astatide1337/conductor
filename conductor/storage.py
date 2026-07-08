@@ -358,19 +358,27 @@ class ConductorStorage:
         current = self.get_run(run_id)
         if not current:
             return None
-        validate_transition(OBJECTIVE_TRANSITIONS, current["status"], target)
+        cs = current["status"]
+        if cs == "created" and target not in OBJECTIVE_TRANSITIONS["created"]:
+            if "active" in OBJECTIVE_TRANSITIONS["created"]:
+                self.update_run_status(run_id, "active")
+                cs = "active"
+        validate_transition(OBJECTIVE_TRANSITIONS, cs, target)
         now = _now_iso()
-        updates = "status = ?"
-        params: list = [target, now, run_id]
         if target in OBJECTIVE_TERMINAL:
-            updates += ", finished_at = ?"
-            params.insert(1, now)
-        with self._connect() as conn:
-            conn.execute(
-                f"UPDATE objective_runs SET {updates} WHERE id = ?",
-                params,
-            )
-            conn.commit()
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE objective_runs SET status = ?, finished_at = ? WHERE id = ?",
+                    (target, now, run_id),
+                )
+                conn.commit()
+        else:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE objective_runs SET status = ? WHERE id = ?",
+                    (target, run_id),
+                )
+                conn.commit()
         return self.get_run(run_id)
 
     # ── Tasks ────────────────────────────────────────────────────────────
