@@ -26,6 +26,12 @@ from conductor.policy import check_action, check_decision
 from conductor.storage import ConductorStorage
 from conductor.clients.agents_gateway import MockAgentsGatewayClient
 
+try:
+    from fastmcp import FastMCP
+    HAS_FASTMCP = True
+except ImportError:
+    HAS_FASTMCP = False
+
 logger = get_logger()
 
 
@@ -274,7 +280,28 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
 
     @app.post("/dry-run")
     async def dry_run(request: Request):
-        raise HTTPException(501, "dry run not implemented — milestone 8")
+        from conductor.planner.deterministic import run_dry_run
+        from conductor.circuit import BreakerEvaluator
+        objectives = storage.list_objectives(status="active", limit=1)
+        if not objectives:
+            return {"message": "No active objectives for dry run"}
+        obj = objectives[0]
+        runs = storage.list_runs(obj["id"], limit=1)
+        if not runs:
+            return {"message": "No active run for dry run"}
+        run = runs[0]
+        circuit = cfg.circuit
+        evaluator = BreakerEvaluator(
+            storage,
+            max_iterations=circuit.max_iterations_per_run,
+            max_cost_usd=circuit.max_cost_usd_per_run,
+            max_concurrent=circuit.max_concurrent_tasks,
+            max_retries=circuit.max_retries_per_task,
+            max_wall_clock=circuit.max_wall_clock_minutes,
+            max_stall=circuit.max_stall_minutes,
+        )
+        result = run_dry_run(storage, run["id"], evaluator)
+        return result.model_dump()
 
     @app.get("/events")
     async def list_events(
@@ -288,6 +315,33 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         events = list_events_fn(storage, objective_id=objective_id, run_id=run_id, task_id=task_id, limit=limit, offset=offset)
         events_serialized = [e.model_dump() for e in events]
         return {"events": events_serialized, "count": len(events_serialized)}
+
+    # ── MCP server mount ────────────────────────────────────────────────
+
+    if HAS_FASTMCP:
+        from conductor.mcp_tools import register_conductor_tools
+        from conductor.circuit import BreakerEvaluator
+
+        mcp_server = FastMCP("Astatide Conductor", instructions="Persistent objective orchestrator for MCP-driven agent workflows.")
+
+        skills_mock = None  # Real client only when configured
+        gw_mock = MockAgentsGatewayClient()
+        gw_mock.register_agent("code-validator", "Code Validator")
+
+        b_evaluator = BreakerEvaluator(
+            storage,
+            max_iterations=cfg.circuit.max_iterations_per_run,
+            max_cost_usd=cfg.circuit.max_cost_usd_per_run,
+            max_concurrent=cfg.circuit.max_concurrent_tasks,
+            max_retries=cfg.circuit.max_retries_per_task,
+            max_wall_clock=cfg.circuit.max_wall_clock_minutes,
+            max_stall=cfg.circuit.max_stall_minutes,
+        )
+
+        register_conductor_tools(mcp_server, cfg, storage, b_evaluator, skills_mock, gw_mock)
+
+        mcp_asgi = mcp_server.http_app(path=cfg.service.mcp_path)
+        app.mount(cfg.service.mcp_path, mcp_asgi)
 
     return app
 
