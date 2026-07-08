@@ -173,18 +173,50 @@ class TestEventsAPI:
 
 
 class TestApprovalsAPI:
+    def test_approval_create_via_storage_and_approve(self, client):
+        from conductor.config import ConductorConfig
+        from conductor.storage import ConductorStorage
+        cfg = ConductorConfig(environment="test")
+        store = ConductorStorage(cfg.storage.sqlite_path)
+        store.initialize()
+
+        obj = store.create_objective(title="Approval Test")
+        run = store.create_run(obj["id"])
+        approval = store.create_approval(obj["id"], run["id"], "deploy_production", description="Test deploy")
+        store.disconnect_hack_or_fix = None  # no need, just test
+
+        # Approve it via API (uses same db but different storage instance — fine)
+        r = client.post(f"/approvals/{approval['id']}/approve")
+        assert r.status_code == 200
+        assert r.json()["approval"]["status"] == "approved"
+
+    def test_approval_reject(self, client):
+        from conductor.config import ConductorConfig
+        from conductor.storage import ConductorStorage
+        cfg = ConductorConfig(environment="test")
+        store = ConductorStorage(cfg.storage.sqlite_path)
+        store.initialize()
+
+        obj = store.create_objective(title="Reject Test")
+        run = store.create_run(obj["id"])
+        approval = store.create_approval(obj["id"], run["id"], "delete_data")
+
+        r = client.post(f"/approvals/{approval['id']}/reject")
+        assert r.status_code == 200
+        assert r.json()["approval"]["status"] == "rejected"
+
     def test_list_approvals_empty(self, client):
         r = client.get("/approvals")
         assert r.status_code == 200
         assert r.json()["count"] == 0
 
-    def test_approve_501(self, client):
+    def test_approve_404_for_unknown(self, client):
         r = client.post("/approvals/fake-id/approve")
-        assert r.status_code == 501
+        assert r.status_code == 404
 
-    def test_reject_501(self, client):
+    def test_reject_404_for_unknown(self, client):
         r = client.post("/approvals/fake-id/reject")
-        assert r.status_code == 501
+        assert r.status_code == 404
 
 
 class TestReconcileAndDryRun:

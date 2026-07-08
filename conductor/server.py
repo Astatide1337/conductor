@@ -239,11 +239,21 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
 
     @app.post("/approvals/{approval_id}/approve")
     async def approve(approval_id: str, request: Request):
-        raise HTTPException(501, "approve endpoint — milestone 3")
+        updated = storage.update_approval_status(approval_id, "approved", decided_by="user")
+        if not updated:
+            raise HTTPException(404, "Approval not found")
+        emit(storage, "approval.approved", f"Approval {approval_id} approved",
+             objective_id=updated["objective_id"], run_id=updated["run_id"], source="user")
+        return {"approval": updated}
 
     @app.post("/approvals/{approval_id}/reject")
     async def reject(approval_id: str, request: Request):
-        raise HTTPException(501, "reject endpoint — milestone 3")
+        updated = storage.update_approval_status(approval_id, "rejected", decided_by="user")
+        if not updated:
+            raise HTTPException(404, "Approval not found")
+        emit(storage, "approval.rejected", f"Approval {approval_id} rejected",
+             objective_id=updated["objective_id"], run_id=updated["run_id"], source="user")
+        return {"approval": updated}
 
     # ── Protected routes: Reconciliation ─────────────────────────────────
 
