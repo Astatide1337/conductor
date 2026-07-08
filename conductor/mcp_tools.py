@@ -196,6 +196,7 @@ def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway
             return _json({"error": "Objective not found"})
         if obj["status"] == "created":
             storage.update_objective_status(objective_id, "active")
+            obj = storage.get_objective(objective_id)
         if obj["status"] == "active":
             storage.update_objective_status(objective_id, "cancelled")
         return _json({"objective": storage.get_objective(objective_id)})

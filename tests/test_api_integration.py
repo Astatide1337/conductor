@@ -224,6 +224,8 @@ class TestReconcileAndDryRun:
         r = client.post("/reconcile")
         assert r.status_code == 501
 
-    def test_dry_run_501(self, client):
+    def test_dry_run_200(self, client):
         r = client.post("/dry-run")
-        assert r.status_code == 501
+        assert r.status_code == 200
+        data = r.json()
+        assert "message" in data or "would_dispatch" in data
