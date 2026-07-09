@@ -91,3 +91,12 @@ def init_conductor_metrics() -> None:
     reg.register("conductor_reconciliation_errors_total", "counter", "Reconciliation errors")
     reg.register("conductor_artifacts_ingested_total", "counter", "Total artifacts ingested")
     reg.register("conductor_circuit_breaker_trips_total", "counter", "Circuit breaker trips", ("breaker",))
+    # ── Gateway Hub ────────────────────────────────────────────────────────
+    reg.register("conductor_gateways_total", "gauge", "Registered gateways")
+    reg.register("conductor_gateways_healthy", "gauge", "Healthy gateways")
+    reg.register("conductor_gateways_unhealthy", "gauge", "Unhealthy gateways")
+    reg.register("conductor_gateway_health_checks_total", "counter", "Gateway health checks performed")
+    reg.register("conductor_gateway_health_check_errors_total", "counter", "Gateway health checks that errored")
+    reg.register("conductor_capability_validation_total", "counter", "Task capability validations performed")
+    reg.register("conductor_capability_validation_failed_total", "counter", "Task capability validations that failed")
+    reg.register("conductor_gateway_actions_total", "counter", "Gateway actions dispatched", ("gateway_kind",))

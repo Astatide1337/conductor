@@ -34,6 +34,14 @@ from conductor.clients.skills_gateway import (
     HttpSkillsGatewayClient,
     MockSkillsGatewayClient,
 )
+from conductor.clients.mcp_gateway import (
+    BaseMcpGatewayClient,
+    HttpMcpGatewayClient,
+    MockMcpGatewayClient,
+    McpGatewayError,
+)
+from conductor.gateways import build_default_registry
+from conductor.gateways.registry import GatewayRegistry, GatewayConfig
 
 
 def _build_gateway_client(cfg: ConductorConfig) -> BaseAgentsGatewayClient:
@@ -59,6 +67,26 @@ def _build_skills_client(cfg: ConductorConfig) -> BaseSkillsGatewayClient | None
     return None
 
 
+def _build_mcp_gateway_client(cfg: ConductorConfig) -> BaseMcpGatewayClient | None:
+    """Real MCP Gateway client when URL + non-dev auth configured; None otherwise.
+
+    Conductor never presents dev-none to a downstream gateway if the operator
+    told us the MCP Gateway URL is real — we drop back to None so the registry
+    can mark the gateway not_configured for the operator to wire up.
+    """
+    mcp_cfg = cfg.mcp_gateway
+    if mcp_cfg.url and mcp_cfg.auth_mode != "dev-none" and not _is_localhost_url(mcp_cfg.url):
+        try:
+            return HttpMcpGatewayClient(mcp_cfg)
+        except McpGatewayError as e:
+            logger.warning("mcp_gateway_init_failed url=%s err=%s", mcp_cfg.url, e)
+            return None
+    if mcp_cfg.url and _is_localhost_url(mcp_cfg.url):
+        # Pure-local dev mock — easy offline experimentation.
+        return MockMcpGatewayClient()
+    return None
+
+
 def _is_localhost_url(url: str) -> bool:
     return "://localhost" in url or "://127.0.0.1" in url or "://0.0.0.0" in url
 
@@ -67,6 +95,53 @@ try:
     HAS_FASTMCP = True
 except ImportError:
     HAS_FASTMCP = False
+
+
+def _build_mcp_app(cfg: ConductorConfig, storage: ConductorStorage,
+                   gateway_client, skills_client, mcp_gateway_client,
+                   gateway_registry, metrics_reg) -> tuple | None:
+    """Build the FastMCP ASGI sub-app + its lifespan, ready to mount.
+
+    Returns `(mount_path, mcp_asgi)` if FastMCP is available, else None.
+
+    The caller is responsible for:
+      1. passing `mcp_asgi.lifespan` to the parent FastAPI app constructor so
+         FastMCP's StreamableHTTPSessionManager can initialize its task group;
+      2. calling `mcp_asgi.add_middleware(MCPAuthMw)` to share Conductor's
+         auth model on the MCP surface;
+      3. mounting it at `mount_path` on the parent app.
+
+    Without step (1), FastMCP returns 500 on every JSON-RPC call with the
+    "task group is not initialized" error — see
+    https://gofastmcp.com/deployment/asgi.
+    """
+    if not HAS_FASTMCP:
+        return None
+    from conductor.mcp_tools import register_conductor_tools
+    from conductor.circuit import BreakerEvaluator
+
+    mcp_server = FastMCP(
+        "Astatide Conductor",
+        instructions="Persistent objective orchestrator for MCP-driven agent workflows.",
+    )
+    b_evaluator = BreakerEvaluator(
+        storage,
+        max_iterations=cfg.circuit.max_iterations_per_run,
+        max_cost_usd=cfg.circuit.max_cost_usd_per_run,
+        max_concurrent=cfg.circuit.max_concurrent_tasks,
+        max_retries=cfg.circuit.max_retries_per_task,
+        max_wall_clock=cfg.circuit.max_wall_clock_minutes,
+        max_stall=cfg.circuit.max_stall_minutes,
+    )
+    register_conductor_tools(
+        mcp_server, cfg, storage, b_evaluator,
+        skills_client, gateway_client,
+        metrics=metrics_reg,
+        gateway_registry=gateway_registry,
+        mcp_gateway_client=mcp_gateway_client,
+    )
+    mcp_asgi = mcp_server.http_app(path=cfg.service.mcp_path)
+    return (cfg.service.mcp_path, mcp_asgi)
 
 logger = get_logger()
 
@@ -84,12 +159,26 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         init_conductor_metrics()
         metrics_reg = get_metrics_registry()
 
+    # Build MCP sub-app BEFORE the parent FastAPI app so we can propagate
+    # FastMCP's lifespan to the parent — without this, FastMCP's streamable
+    # HTTP session manager raises "task group is not initialized" on every
+    # JSON-RPC call (see https://gofastmcp.com/deployment/asgi).
+    # If FastMCP is unavailable, mcp_pair is None and the lifespan stays None.
+    mcp_pair = _build_mcp_app(
+        cfg, storage,
+        _build_gateway_client(cfg), _build_skills_client(cfg),
+        _build_mcp_gateway_client(cfg), build_default_registry(cfg),
+        metrics_reg,
+    )
+    mcp_lifespan = mcp_pair[1].lifespan if mcp_pair else None
+
     app = FastAPI(
         title="Astatide Conductor",
         version=VERSION,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=mcp_lifespan,
     )
 
     # Store shared state
@@ -99,6 +188,17 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
     app.state.metrics = metrics_reg
     app.state.gateway_client = _build_gateway_client(cfg)
     app.state.skills_client = _build_skills_client(cfg)
+    app.state.mcp_gateway_client = _build_mcp_gateway_client(cfg)
+    app.state.gateway_registry = build_default_registry(cfg)
+
+    # Emit gateway.registered events once at startup so the operator timeline
+    # reflects the configured hub at boot.
+    from conductor.gateways.events import emit_gateway_registered
+    for gw in app.state.gateway_registry.all():
+        try:
+            emit_gateway_registered(storage, gw.id, gw.kind, gw.name)
+        except Exception as e:
+            logger.warning("gateway_registered_emit_failed id=%s err=%s", gw.id, e)
 
     # Middleware — outer middleware handles /mcp with JSON-RPC-shaped errors
     # (sub-app middleware below is defense-in-depth).
@@ -277,6 +377,7 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
                 app.state.gateway_client,
                 task_id,
                 skills_client=app.state.skills_client,
+                registry=app.state.gateway_registry,
                 metrics=app.state.metrics,
             )
             return JSONResponse(result, status_code=200)
@@ -365,36 +466,148 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         events_serialized = [e.model_dump() for e in events]
         return {"events": events_serialized, "count": len(events_serialized)}
 
+    # ── Protected routes: Gateway Hub ─────────────────────────────────────
+
+    from conductor.gateways.capabilities import (
+        list_capabilities as _list_caps,
+        find_gateways_for_capability as _find_caps,
+    )
+    from conductor.gateways.health import (
+        check_gateway_health as _check_health,
+        check_all_gateways as _check_all,
+    )
+    from conductor.gateways.events import emit_gateway_health_checked
+
+    def _serialize_gateway(gw: GatewayConfig) -> dict:
+        return {
+            "id": gw.id, "kind": gw.kind, "name": gw.name,
+            "enabled": gw.enabled, "configured": bool(gw.base_url),
+            "base_url_present": bool(gw.base_url),
+            "auth_mode": gw.auth_mode,
+            "health_path": gw.health_path, "version_path": gw.version_path,
+            "timeout_seconds": gw.timeout_seconds,
+            "metadata": gw.metadata,
+        }
+
+    @app.get("/gateways")
+    async def list_gateways(request: Request):
+        reg: GatewayRegistry = app.state.gateway_registry
+        return {"gateways": [_serialize_gateway(g) for g in reg.all()],
+                "count": len(reg.all())}
+
+    @app.get("/gateways/status")
+    async def gateways_status(request: Request):
+        reg: GatewayRegistry = app.state.gateway_registry
+        statuses = []
+        for gw in reg.all():
+            if not gw.base_url:
+                st = "not_configured"
+            elif not gw.enabled:
+                st = "disabled"
+            else:
+                st = "unknown"
+            statuses.append({
+                "id": gw.id, "kind": gw.kind, "name": gw.name,
+                "enabled": gw.enabled, "configured": bool(gw.base_url),
+                "base_url_present": bool(gw.base_url),
+                "auth_mode": gw.auth_mode,
+                "status": st,
+                "healthy": st == "healthy",
+                "last_checked_at": "",
+            })
+        return {"gateways": statuses, "count": len(statuses)}
+
+    @app.get("/gateways/{gateway_id}")
+    async def get_gateway(gateway_id: str, request: Request):
+        reg: GatewayRegistry = app.state.gateway_registry
+        gw = reg.get(gateway_id)
+        if not gw:
+            raise HTTPException(404, "Gateway not found")
+        return {"gateway": _serialize_gateway(gw)}
+
+    @app.post("/gateways/{gateway_id}/check")
+    async def check_gateway(gateway_id: str, request: Request):
+        reg: GatewayRegistry = app.state.gateway_registry
+        if not reg.has(gateway_id):
+            raise HTTPException(404, "Gateway not found")
+        status = _check_health(reg, gateway_id)
+        if status is None:
+            raise HTTPException(404, "Gateway not found")
+        try:
+            emit_gateway_health_checked(
+                storage, status.id, status.kind,
+                status=status.status,
+                latency_ms=status.latency_ms,
+                capabilities=status.capabilities,
+            )
+        except Exception as e:
+            logger.warning("gateway_health_emit_failed id=%s err=%s", gateway_id, e)
+        if metrics_reg:
+            metrics_reg.inc("conductor_gateway_health_checks_total")
+            if status.status not in ("healthy", "not_configured", "disabled"):
+                metrics_reg.inc("conductor_gateway_health_check_errors_total")
+        return {"status": status.model_dump()}
+
+    @app.post("/gateways/check-all")
+    async def check_all(request: Request):
+        reg: GatewayRegistry = app.state.gateway_registry
+        statuses = _check_all(reg)
+        for st in statuses:
+            try:
+                emit_gateway_health_checked(
+                    storage, st.id, st.kind,
+                    status=st.status, latency_ms=st.latency_ms,
+                    capabilities=st.capabilities,
+                )
+            except Exception as e:
+                logger.warning("gateway_health_emit_failed id=%s err=%s", st.id, e)
+            if metrics_reg:
+                metrics_reg.inc("conductor_gateway_health_checks_total")
+                if st.status not in ("healthy", "not_configured", "disabled"):
+                    metrics_reg.inc("conductor_gateway_health_check_errors_total")
+        if metrics_reg:
+            healthy_count = sum(1 for s in statuses if s.status == "healthy")
+            unhealthy_count = len(statuses) - healthy_count
+            metrics_reg.set("conductor_gateways_total", float(len(reg.all())))
+            metrics_reg.set("conductor_gateways_healthy", float(healthy_count))
+            metrics_reg.set("conductor_gateways_unhealthy", float(unhealthy_count))
+        return {"statuses": [s.model_dump() for s in statuses], "count": len(statuses)}
+
+    @app.get("/capabilities")
+    async def list_capabilities_route(request: Request, gateway_id: str | None = None):
+        reg: GatewayRegistry = app.state.gateway_registry
+        caps = _list_caps(reg, gateway_id=gateway_id)
+        return {"capabilities": [c.model_dump() for c in caps], "count": len(caps)}
+
+    @app.get("/capabilities/{capability}")
+    async def get_capability(capability: str, request: Request):
+        reg: GatewayRegistry = app.state.gateway_registry
+        candidates = _find_caps(reg, capability)
+        return {"capability": capability, "candidates": [c.model_dump() for c in candidates],
+                "count": len(candidates)}
+
+    # ── Protected routes: Objective timeline ────────────────────────────────
+
+    @app.get("/objectives/{objective_id}/timeline")
+    async def get_objective_timeline(objective_id: str, request: Request, limit: int = 200):
+        obj = storage.get_objective(objective_id)
+        if not obj:
+            raise HTTPException(404, "Objective not found")
+        events = list_events_fn(storage, objective_id=objective_id, limit=limit, offset=0)
+        timeline = [e.model_dump() for e in reversed(events)]
+        return {"objective_id": objective_id, "count": len(timeline), "events": timeline}
+
     # ── MCP server mount ────────────────────────────────────────────────
+    # The MCP sub-app was built earlier in create_app so its lifespan could
+    # be propagated to the parent FastAPI app (FastMCP requires this for
+    # its StreamableHTTPSessionManager to initialize). Here we just attach
+    # the auth middleware and mount it.
 
-    if HAS_FASTMCP:
-        from conductor.mcp_tools import register_conductor_tools
-        from conductor.circuit import BreakerEvaluator
-
-        mcp_server = FastMCP("Astatide Conductor", instructions="Persistent objective orchestrator for MCP-driven agent workflows.")
-
-        b_evaluator = BreakerEvaluator(
-            storage,
-            max_iterations=cfg.circuit.max_iterations_per_run,
-            max_cost_usd=cfg.circuit.max_cost_usd_per_run,
-            max_concurrent=cfg.circuit.max_concurrent_tasks,
-            max_retries=cfg.circuit.max_retries_per_task,
-            max_wall_clock=cfg.circuit.max_wall_clock_minutes,
-            max_stall=cfg.circuit.max_stall_minutes,
-        )
-
-        register_conductor_tools(
-            mcp_server, cfg, storage, b_evaluator,
-            app.state.skills_client, app.state.gateway_client,
-            metrics=app.state.metrics,
-        )
-
-        mcp_asgi = mcp_server.http_app(path=cfg.service.mcp_path)
-        # Wrap MCP sub-app in the same auth model as the rest of Conductor.
-        # No public paths on /mcp — any cockpit must identify itself via internal token or CF JWT.
+    if mcp_pair is not None:
+        mount_path, mcp_asgi = mcp_pair
         MCPAuthMw = make_mcp_auth_middleware_cls(auth_handler)
         mcp_asgi.add_middleware(MCPAuthMw)
-        app.mount(cfg.service.mcp_path, mcp_asgi)
+        app.mount(mount_path, mcp_asgi)
 
     return app
 

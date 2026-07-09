@@ -30,6 +30,8 @@ EVENT_SOURCES = {
     "planner",
     "agents_gateway",
     "skills_gateway",
+    "mcp_gateway",
+    "wiki_mcp",
     "system",
 }
 

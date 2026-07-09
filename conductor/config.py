@@ -53,6 +53,27 @@ class SkillsGatewayClientConfig(BaseModel):
     timeout_seconds: float = 10.0
 
 
+class McpGatewayClientConfig(BaseModel):
+    """MCP Gateway as a downstream capability provider (external tool routing,
+    connectors, GitHub/Drive/Calendar/mail). Conductor treats it as one of
+    several downstream gateways — not as a parent of Conductor."""
+    url: str = ""
+    auth_mode: str = "dev-none"
+    internal_token: str = ""
+    timeout_seconds: float = 10.0
+
+
+class WikiMcpClientConfig(BaseModel):
+    """wiki-mcp downstream — durable memory, project context, decision logs.
+
+    Disabled by default; opt in by setting CONDUCTOR_WIKI_MCP_URL and
+    CONDUCTOR_WIKI_MCP_AUTH_MODE."""
+    url: str = ""
+    auth_mode: str = "dev-none"
+    internal_token: str = ""
+    timeout_seconds: float = 10.0
+
+
 class CircuitConfig(BaseModel):
     max_iterations_per_run: int = 50
     max_cost_usd_per_run: float = 10.0
@@ -78,6 +99,8 @@ class ConductorConfig(BaseModel):
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     agents_gateway: AgentsGatewayClientConfig = field(default_factory=AgentsGatewayClientConfig)
     skills_gateway: SkillsGatewayClientConfig = field(default_factory=SkillsGatewayClientConfig)
+    mcp_gateway: McpGatewayClientConfig = field(default_factory=McpGatewayClientConfig)
+    wiki_mcp: WikiMcpClientConfig = field(default_factory=WikiMcpClientConfig)
     circuit: CircuitConfig = field(default_factory=CircuitConfig)
     planner: PlannerConfig = field(default_factory=PlannerConfig)
     environment: str = "dev"

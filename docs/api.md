@@ -89,7 +89,6 @@ Response (200):
 |---|---|---|---|
 | POST | `/reconcile` | 200 | Reconcile all in-flight agent_runs against the Agents Gateway |
 | POST | `/dry-run` | 200 | Deterministic dry-run analysis |
-
 ```bash
 curl -X POST http://localhost:8093/reconcile
 ```
@@ -155,6 +154,141 @@ Response when skills are missing (200):
 The `task.skills_validation_failed` event is emitted with `payload.original_status`
 and `payload.missing_skills`.
 
+## Dispatch — capability validation gate
+
+After the skill gate, if the task's `metadata.required_capabilities` is
+non-empty, Conductor runs the **capability gate**: each required
+capability is checked against the Gateway Hub registry to ensure at
+least one configured+enabled gateway provides it. Missing capabilities
+block dispatch:
+
+Response when capabilities are missing (200):
+```json
+{
+  "task_id": "uuid",
+  "status": "ready",
+  "agent_run": null,
+  "error": "missing required capabilities: ['execution.task.create']",
+  "missing_capabilities": ["execution.task.create"],
+  "degraded_capabilities": [],
+  "satisfied_capabilities": []
+}
+```
+
+The `task.capabilities_validation_failed` event is emitted with payload
+`{missing_capabilities, degraded_capabilities, satisfied_capabilities,
+original_status}`. When the gate passes, `task.capabilities_validated` is
+emitted.
+
+Capability catalog and standard capability strings are documented in
+`docs/gateway-hub.md`.
+
+## Gateway Hub
+
+| Method | Path | Status | Description |
+|---|---|---|---|
+| GET | `/gateways` | 200 | List configured gateways (no live probe) |
+| GET | `/gateways/status` | 200 | Lightweight status snapshot (no live probe) |
+| GET | `/gateways/{gateway_id}` | 200 | Get a single gateway config |
+| POST | `/gateways/{gateway_id}/check` | 200 | Live-probe one gateway |
+| POST | `/gateways/check-all` | 200 | Live-probe every configured gateway |
+| GET | `/capabilities` | 200 | List all capabilities (`?gateway_id=` optional filter) |
+| GET | `/capabilities/{capability}` | 200 | Find candidate gateways that provide a capability |
+
+### List gateways
+
+```bash
+curl -X GET http://localhost:8093/gateways
+```
+
+Response (200):
+```json
+{
+  "gateways": [
+    {"id":"agents","kind":"agents","name":"Agents Gateway","enabled":true,"configured":true,...},
+    {"id":"skills","kind":"skills","name":"Skills Gateway","enabled":true,"configured":true,...},
+    {"id":"mcp","kind":"mcp","name":"MCP Gateway","enabled":false,"configured":false,...},
+    {"id":"wiki","kind":"wiki","name":"wiki-mcp","enabled":false,"configured":false,...}
+  ],
+  "count": 4
+}
+```
+
+### Check all gateways
+
+```bash
+curl -X POST http://localhost:8093/gateways/check-all
+```
+
+Response (200):
+```json
+{
+  "statuses": [
+    {"id":"agents","kind":"agents","name":"Agents Gateway",
+     "enabled":true,"configured":true,"healthy":true,"status":"healthy",
+     "base_url_present":true,"auth_mode":"internal-only",
+     "version":"1.0.0","capabilities":["execution.task.create",...],
+     "last_checked_at":"2026-07-09T...","latency_ms":12.4,"error":null}
+  ],
+  "count": 4
+}
+```
+
+Each status includes the static capability list for its gateway kind, so
+operators can answer "What can Conductor do, and via which gateway?" from
+one call.
+
+### Find capability
+
+```bash
+curl -X GET http://localhost:8093/capabilities/execution.task.create
+```
+
+Response (200):
+```json
+{
+  "capability": "execution.task.create",
+  "candidates": [
+    {"capability":"execution.task.create","gateway_id":"agents",
+     "gateway_kind":"agents","available":true,"source":"static",
+     "description":"Create execution tasks through Agents Gateway."}
+  ],
+  "count": 1
+}
+```
+
+## Objective timeline
+
+| Method | Path | Status | Description |
+|---|---|---|---|
+| GET | `/objectives/{objective_id}/timeline` | 200 | Chronological order of all events for an objective |
+
+```bash
+curl -X GET http://localhost:8093/objectives/{objective_id}/timeline
+```
+
+Response (200):
+```json
+{
+  "objective_id": "uuid",
+  "count": 12,
+  "events": [
+    {"event_type":"objective.created","created_at":"...","message":"..."},
+    {"event_type":"task.created","...":"..."},
+    {"event_type":"task.skills_validated","...":"..."},
+    {"event_type":"task.capabilities_validated","...":"..."},
+    {"event_type":"task.dispatch_requested","...":"..."},
+    {"event_type":"gateway.agents.dispatch","...":"..."},
+    {"event_type":"agent_run.created","...":"..."},
+    {"event_type":"agent_run.reconciled","...":"..."},
+    {"event_type":"artifacts.ingested","...":"..."}
+  ]
+}
+```
+
+Cockpits use this as the "What happened with objective X?" entry point —
+no need to inspect each downstream gateway individually.
+
 ## Authentication
 
 Protected routes require one of:
@@ -188,11 +322,24 @@ The full tool list:
 | `conductor_get_objective` | Get objective with runs |
 | `conductor_list_objectives` | List objectives (filters: `?status=`, `?limit=`) |
 | `conductor_get_status` | Comprehensive status (objective/run/tasks/approvals/circuit-breakers) |
-| `conductor_create_task` | Create a task under an objective's active run |
-| `conductor_dispatch_task` | Dispatch a task via the shared Agents Gateway client (with skill validation) |
+| `conductor_create_task` | Create a task under an objective's active run (accepts `required_capabilities_json`) |
+| `conductor_dispatch_task` | Dispatch a task via the shared Agents Gateway client (with skill + capability validation) |
 | `conductor_list_approvals` | List pending approvals |
 | `conductor_approve` | Approve a pending approval |
 | `conductor_reject` | Reject a pending approval |
+| `conductor_steer_objective` | Add steering guidance to an objective |
+| `conductor_pause_objective` | Pause an objective |
+| `conductor_resume_objective` | Resume a paused/created objective |
+| `conductor_cancel_objective` | Cancel an objective |
+| `conductor_dry_run` | Deterministic dry-run analysis |
 | `conductor_reconcile` | Run reconciliation against the Agents Gateway |
 | `conductor_view_events` | Inspect events with `objective_id`/`run_id`/`task_id`/`limit` filters |
-| plus: `conductor_pause_objective`, `conductor_resume_objective`, `conductor_cancel_objective`, `conductor_get_objective_status`, `conductor_dry_run`, `conductor_health` | (legacy/utility tools) |
+| `conductor_health_check` | Conductor service health + planner + auth mode |
+| `conductor_list_gateways` | **New** — list configured gateways (no probe) |
+| `conductor_get_gateway_status` | **New** — single gateway lightweight status |
+| `conductor_check_gateway_health` | **New** — live-probe one gateway |
+| `conductor_check_all_gateways` | **New** — live-probe every gateway |
+| `conductor_list_capabilities` | **New** — list capabilities across the hub |
+| `conductor_find_capability` | **New** — find candidate gateways for a capability |
+| `conductor_call_mcp_gateway_tool` | **New, EXPERIMENTAL** — invoke a downstream MCP Gateway tool by name |
+| `conductor_get_timeline` | **New** — chronological timeline for an objective |

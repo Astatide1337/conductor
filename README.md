@@ -23,20 +23,22 @@ Persistent objective/task-graph orchestrator for MCP-driven agent workflows.
 ## Architecture
 
 ```
-Any MCP-capable cockpit
-      |
-      v
-MCP Gateway ──────────────────────┐
-      |                            │
-      v                            v
-Conductor ◄───────────────── Skills Gateway + wiki-mcp
-      |
-      v
-Agents Gateway
-      |
-      v
-Runtime substrate (process/docker/future harness-tmux)
+Any MCP-compatible cockpit (Claude / ChatGPT / Polychat / CLI / future UI)
+       |
+       v
+   CONDUCTOR  ─── single hub (REST + MCP)
+       |
+   +---+---+---+---+---------+
+   |   |   |   |   |         |
+   v   v   v   v   v         v
+Agents Skills MCP wiki  future gateways
+Gateway Gateway Gateway mcp  (mail / calendar / cloud / deploy)
 ```
+
+Conductor is the single hub. Gateways are downstream capability providers
+— the MCP Gateway is one of them, not the parent of Conductor. See
+[`docs/gateway-hub.md`](docs/gateway-hub.md) for the full Gateway Hub
+reference.
 
 ## Auth model
 
@@ -72,6 +74,16 @@ Gateway **before any state transition** in `dispatch_task`:
 3. If the gateway is not configured (`CONDUCTOR_SKILLS_GATEWAY_URL` unset or
    localhost), validation is a no-op and the task dispatches normally.
 
+## Capability validation before dispatch
+
+A task may declare `required_capabilities` in its `metadata` (a JSON list
+of dotted capability strings like `["execution.task.create", "external.github"]`).
+Conductor's Gateway Hub validates each capability has at least one
+configured+enabled provider **before** any state transition. Missing or
+degraded capabilities block dispatch and emit a
+`task.capabilities_validation_failed` event; passing emits
+`task.capabilities_validated`. See [`docs/gateway-hub.md`](docs/gateway-hub.md).
+
 ## Local dev
 
 ```bash
@@ -92,8 +104,9 @@ Config precedence: CLI flags > env vars > YAML > defaults.
 ## Testing
 
 ```bash
-uv run pytest -q        # 289+ tests, all offline (uses mocks)
-bash scripts/e2e-local.sh   # 15/15 smoke (offline)
+uv run pytest -q                       # 390+ tests, all offline (uses mocks)
+bash scripts/e2e-local.sh              # 15/15 smoke (offline, pre-existing)
+bash scripts/e2e-local-gateway-hub.sh  # 17/17 gateway hub smoke (offline)
 ```
 
 ## Docker
@@ -105,20 +118,15 @@ docker compose up -d --build
 
 ## Live E2E (real gateway)
 
-The full path through the production Agents Gateway + Skills Gateway is
-exercised by `scripts/e2e-live-agents.sh`. It refuses to run without
-credentials. See [`docs/live-e2e.md`](docs/live-e2e.md) for the env var
-list, expected output, and interpretation guide.
+Two live E2E pathways, both refusing to run without credentials:
 
-```bash
-export CONDUCTOR_BASE_URL=...
-export CONDUCTOR_AUTH_MODE=internal-only
-export CONDUCTOR_INTERNAL_TOKEN=...
-export CONDUCTOR_AGENTS_GATEWAY_URL=...
-export CONDUCTOR_AGENTS_GATEWAY_AUTH_MODE=internal-only
-export CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN=...
-bash scripts/e2e-live-agents.sh
-```
+| Script | Scope |
+|---|---|
+| `scripts/e2e-live-agents.sh` | Agents Gateway + Skills Gateway |
+| `scripts/e2e-live-gateway-hub.sh` | Agents + Skills + MCP Gateway (+ optional wiki) |
+
+See [`docs/live-e2e.md`](docs/live-e2e.md) for the env var list, expected
+output, and interpretation guide.
 
 ## Deployment modes
 
@@ -133,10 +141,16 @@ Cloudflare Access + app validates Cloudflare Access JWTs.
 ## Known limitations
 
 - LLM planner is **not** built; deferred to a later milestone.
+- Autonomous loop mode is **not** built; deferred.
 - Harness/tmux runtime is **not** built; only the existing Mock/HTTP
   Agents Gateway clients are exercised.
-- Live E2E only runs when real gateway credentials are provided. The script
-  exits 2 and lists the missing env vars otherwise.
+- Live E2E only runs when real gateway credentials are provided. The
+  scripts exit 2 and list the missing env vars otherwise.
 - Skills validation requires Skills Gateway configuration.
+- The MCP Gateway downstream client supports `health / version /
+  tools/list / tools/call` — a standard MCP surface. Custom gateway
+  deployments with a different surface may need a new client adapter.
+- Capability catalog is static per gateway kind for this milestone.
+  Dynamic discovery is planned for a later milestone.
 - Conductor does NOT run shell commands, NOT bypass Agents Gateway, NOT
   bypass human approval for irreversible actions.

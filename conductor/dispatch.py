@@ -33,6 +33,7 @@ def dispatch_task(
     dispatch_profile: str = "",
     attempt: int = 1,
     skills_client: BaseSkillsGatewayClient | None = None,
+    registry=None,
     metrics=None,
 ) -> dict:
     task = storage.get_task(task_id)
@@ -81,6 +82,72 @@ def dispatch_task(
                 task_id=task_id, source="conductor",
                 payload={"validated_skills": valid},
             )
+
+    # ── Capability validation gate — runs AFTER skills, BEFORE transitions. ──
+    # If a gateway registry is wired in, restore required_capabilities from task
+    # metadata and validate each capability has at least one configured+enabled
+    # provider. Missing capabilities block dispatch exactly like missing skills
+    # — no agent_run row, no gateway call, task stays in its original state.
+    # Degrade (capability exists but provider unhealthy) is reported but does
+    # NOT block by default unless `require_healthy=True` is passed via registry
+    # metadata — `registry.metadata` may carry {"require_healthy": True}.
+    if registry is not None:
+        from conductor.gateways.validation import (
+            validate_required_capabilities,
+            get_required_capabilities_from_task,
+        )
+        required_caps = get_required_capabilities_from_task(task)
+        if required_caps:
+            require_healthy = bool(getattr(registry, "metadata", {}) \
+                .get("require_healthy", False) if hasattr(registry, "metadata") else False)
+            result = validate_required_capabilities(
+                registry, required_caps,
+                require_healthy=require_healthy,
+            )
+            block_caps = result.missing if not require_healthy else (
+                result.missing + result.degraded
+            )
+            if block_caps:
+                logger.warning(
+                    "dispatch_capabilities_missing task_id=%s missing=%s degraded=%s",
+                    task_id, result.missing, result.degraded,
+                )
+                emit(
+                    storage, "task.capabilities_validation_failed",
+                    f"Task {task_id} missing required capabilities: {block_caps}",
+                    objective_id=task["objective_id"], run_id=task["run_id"],
+                    task_id=task_id, source="conductor",
+                    payload={
+                        "missing_capabilities": result.missing,
+                        "degraded_capabilities": result.degraded,
+                        "satisfied_capabilities": result.satisfied,
+                        "original_status": task["status"],
+                    },
+                )
+                if metrics:
+                    metrics.inc("conductor_dispatch_errors_total")
+                    metrics.inc("conductor_capability_validation_failed_total")
+                return {
+                    "task_id": task_id,
+                    "status": task["status"],
+                    "agent_run": None,
+                    "error": f"missing required capabilities: {block_caps}",
+                    "missing_capabilities": result.missing,
+                    "degraded_capabilities": result.degraded,
+                    "satisfied_capabilities": result.satisfied,
+                }
+            emit(
+                storage, "task.capabilities_validated",
+                f"Task {task_id} required capabilities validated: {result.satisfied}",
+                objective_id=task["objective_id"], run_id=task["run_id"],
+                task_id=task_id, source="conductor",
+                payload={
+                    "satisfied_capabilities": result.satisfied,
+                    "degraded_capabilities": result.degraded,
+                },
+            )
+            if metrics:
+                metrics.inc("conductor_capability_validation_total")
 
     # ── Dispatch requested — fires after the gate passes (or no skills_client). ──
     emit(
@@ -146,6 +213,18 @@ def dispatch_task(
             objective_id=task["objective_id"], run_id=task["run_id"],
             task_id=task_id, agent_run_id=agent_run["id"], source="conductor",
             payload={"agents_gateway_task_id": gw_task.id},
+        )
+        # Also emit the spec gateway.* audit event for the cockpit timeline.
+        emit(
+            storage, "gateway.agents.dispatch",
+            f"Dispatched task {task_id} to agents gateway task {gw_task.id}",
+            objective_id=task["objective_id"], run_id=task["run_id"],
+            task_id=task_id, source="conductor",
+            payload={
+                "gateway_id": "agents", "gateway_kind": "agents",
+                "agent_id": agent_id,
+                "agents_gateway_task_id": gw_task.id,
+            },
         )
 
         # Now run the task

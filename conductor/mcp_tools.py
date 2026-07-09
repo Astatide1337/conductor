@@ -14,7 +14,8 @@ def _json(obj) -> str:
     return json.dumps(obj, indent=2, default=str) if not isinstance(obj, str) else obj
 
 
-def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway_client, metrics=None):
+def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway_client,
+                             metrics=None, gateway_registry=None, mcp_gateway_client=None):
     """Register all conductor MCP tools on a FastMCP server instance."""
 
     @mcp.tool()
@@ -101,12 +102,25 @@ def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway
         brief: str = "",
         task_type: str = "ship",
         required_skills_json: str = "[]",
+        required_capabilities_json: str = "[]",
         depends_on_json: str = "[]",
         approval_required: bool = False,
+        metadata_json: str = "{}",
     ) -> str:
-        """Create a task under an objective's active run."""
+        """Create a task under an objective's active run.
+
+        `required_capabilities_json` is a JSON list of dotted capability
+        strings (e.g. ["execution.task.create","external.github"]) the caller
+        requires Conductor's downstream gateway hub to provide. They are
+        stored in task metadata `required_capabilities` and validated by
+        the dispatch capability gate.
+        """
         required_skills = json.loads(required_skills_json) if required_skills_json else []
+        required_caps = json.loads(required_capabilities_json) if required_capabilities_json else []
         depends_on = json.loads(depends_on_json) if depends_on_json else []
+        md = json.loads(metadata_json) if metadata_json else {}
+        if required_caps:
+            md["required_capabilities"] = required_caps
         runs = storage.list_runs(objective_id, limit=1)
         if not runs:
             return _json({"error": "No active run for objective"})
@@ -115,6 +129,7 @@ def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway
             objective_id, run_id, title, brief=brief,
             task_type=task_type, depends_on=depends_on,
             required_skills=required_skills, approval_required=approval_required,
+            metadata=md,
         )
         return _json(task)
 
@@ -125,7 +140,7 @@ def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway
         try:
             result = do_dispatch(
                 storage, gateway_client, task_id,
-                skills_client=skills_client, metrics=metrics,
+                skills_client=skills_client, registry=gateway_registry, metrics=metrics,
             )
             return _json({"agent_run": result, "status": result["status"]})
         except Exception as e:
@@ -264,3 +279,187 @@ def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway
             "planner_mode": cfg.planner.mode,
             "auth_mode": cfg.auth.mode,
         })
+
+    # ── Gateway Hub tools ────────────────────────────────────────────────
+    # Conductor is the single hub; these tools let the cockpit see every
+    # downstream gateway, its health, and its capabilities. No secrets are
+    # exposed — GatewayConfig never carries tokens, and the HTTP probes only
+    # return status/latency/version/capabilities.
+
+    @mcp.tool()
+    async def conductor_list_gateways() -> str:
+        """List all configured downstream gateways (agents, skills, mcp, wiki, custom).
+
+        Does not perform live health probes. Returns id, kind, name, enabled,
+        configured (base_url present), auth_mode, timeout, and metadata.
+        """
+        if gateway_registry is None:
+            return _json({"gateways": [], "count": 0})
+        gateways = []
+        for gw in gateway_registry.all():
+            gateways.append({
+                "id": gw.id, "kind": gw.kind, "name": gw.name,
+                "enabled": gw.enabled, "configured": bool(gw.base_url),
+                "auth_mode": gw.auth_mode,
+                "timeout_seconds": gw.timeout_seconds,
+                "metadata": gw.metadata,
+            })
+        return _json({"gateways": gateways, "count": len(gateways)})
+
+    @mcp.tool()
+    async def conductor_get_gateway_status(gateway_id: str) -> str:
+        """Return the lightweight (non-probed) status of a single gateway.
+
+        Possible statuses: unknown, not_configured, disabled.
+        Use conductor_check_gateway_health for a live probe.
+        """
+        if gateway_registry is None:
+            return _json({"error": "gateway registry disabled"})
+        gw = gateway_registry.get(gateway_id)
+        if not gw:
+            return _json({"error": "gateway not found", "gateway_id": gateway_id})
+        if not gw.base_url:
+            st = "not_configured"
+        elif not gw.enabled:
+            st = "disabled"
+        else:
+            st = "unknown"
+        return _json({
+            "id": gw.id, "kind": gw.kind, "name": gw.name,
+            "enabled": gw.enabled, "configured": bool(gw.base_url),
+            "auth_mode": gw.auth_mode, "status": st,
+            "healthy": st == "healthy",
+        })
+
+    @mcp.tool()
+    async def conductor_check_gateway_health(gateway_id: str) -> str:
+        """Live-probe a single downstream gateway and return its status.
+
+        Returns status, latency_ms, version (if known), and capabilities.
+        Emits a `gateway.health_checked` (or `gateway.health_failed`) event.
+        """
+        if gateway_registry is None:
+            return _json({"error": "gateway registry disabled"})
+        from conductor.gateways.health import check_gateway_health
+        from conductor.gateways.events import emit_gateway_health_checked
+        status = check_gateway_health(gateway_registry, gateway_id)
+        if status is None:
+            return _json({"error": "gateway not found", "gateway_id": gateway_id})
+        try:
+            emit_gateway_health_checked(
+                storage, status.id, status.kind,
+                status=status.status, latency_ms=status.latency_ms,
+                capabilities=status.capabilities,
+            )
+        except Exception:
+            pass
+        if metrics:
+            metrics.inc("conductor_gateway_health_checks_total")
+            if status.status not in ("healthy", "not_configured", "disabled"):
+                metrics.inc("conductor_gateway_health_check_errors_total")
+        return _json(status.model_dump())
+
+    @mcp.tool()
+    async def conductor_check_all_gateways() -> str:
+        """Live-probe every configured downstream gateway and return statuses."""
+        if gateway_registry is None:
+            return _json({"statuses": [], "count": 0})
+        from conductor.gateways.health import check_all_gateways
+        from conductor.gateways.events import emit_gateway_health_checked
+        statuses = check_all_gateways(gateway_registry)
+        for st in statuses:
+            try:
+                emit_gateway_health_checked(
+                    storage, st.id, st.kind,
+                    status=st.status, latency_ms=st.latency_ms,
+                    capabilities=st.capabilities,
+                )
+            except Exception:
+                pass
+            if metrics:
+                metrics.inc("conductor_gateway_health_checks_total")
+                if st.status not in ("healthy", "not_configured", "disabled"):
+                    metrics.inc("conductor_gateway_health_check_errors_total")
+        return _json({
+            "statuses": [s.model_dump() for s in statuses],
+            "count": len(statuses),
+        })
+
+    @mcp.tool()
+    async def conductor_list_capabilities(gateway_id: str = "") -> str:
+        """List all capabilities known across the gateway hub, optionally filtered."""
+        if gateway_registry is None:
+            return _json({"capabilities": [], "count": 0})
+        from conductor.gateways.capabilities import list_capabilities
+        gid = gateway_id or None
+        caps = list_capabilities(gateway_registry, gateway_id=gid)
+        return _json({"capabilities": [c.model_dump() for c in caps], "count": len(caps)})
+
+    @mcp.tool()
+    async def conductor_find_capability(capability: str) -> str:
+        """Find candidate gateways that can provide a capability.
+
+        Useful for "Where can I get external.github?" type questions from a
+        cockpit. Returns the list of (gateway_id, gateway_kind, available)
+        entries — operator may then dispatch to whichever makes sense.
+        """
+        if gateway_registry is None:
+            return _json({"capability": capability, "candidates": [], "count": 0})
+        from conductor.gateways.capabilities import find_gateways_for_capability
+        candidates = find_gateways_for_capability(gateway_registry, capability)
+        return _json({
+            "capability": capability,
+            "candidates": [c.model_dump() for c in candidates],
+            "count": len(candidates),
+        })
+
+    @mcp.tool()
+    async def conductor_call_mcp_gateway_tool(
+        tool_name: str,
+        arguments_json: str = "{}",
+        objective_id: str = "",
+    ) -> str:
+        """EXPERIMENTAL — policy-gated invocation of a downstream MCP Gateway tool.
+
+        Only intended for cockpit operators who explicitly want to drive the
+        MCP Gateway through Conductor. Conductor emits a
+        `gateway.mcp.tool_call` event in the timeline. Tokens and arguments
+        are never logged verbatim — only the tool name is recorded.
+
+        Returns the raw tool result body, or an error object if the MCP
+        Gateway is not configured or the tool call fails.
+        """
+        if mcp_gateway_client is None:
+            return _json({"error": "MCP Gateway client is not configured"})
+        args = json.loads(arguments_json) if arguments_json else {}
+        obj_id = objective_id or None
+        from conductor.gateways.events import emit_gateway_mcp_tool_call
+        try:
+            result = mcp_gateway_client.call_tool(tool_name, args)
+            try:
+                emit_gateway_mcp_tool_call(
+                    storage, gateway_id="mcp", tool_name=tool_name,
+                    arguments=None, objective_id=obj_id,
+                )
+            except Exception:
+                pass
+            if metrics:
+                metrics.inc("conductor_gateway_actions_total", labels=("mcp",))
+            return _json({"tool": tool_name, "result": result, "ok": True})
+        except Exception as e:
+            return _json({"tool": tool_name, "error": str(e), "ok": False})
+
+    @mcp.tool()
+    async def conductor_get_timeline(objective_id: str, limit: int = 200) -> str:
+        """Return the chronological timeline of all events for an objective.
+
+        Includes objective/task lifecycle, gateway checks, dispatches,
+        approvals, and reconciliations — everything Conductor knows about
+        what happened with a given objective. Cockpits should use this as
+        the "What happened with objective X?" entry point.
+        """
+        from conductor.events import list_events
+        events = list_events(storage, objective_id=objective_id, limit=limit)
+        chronological = [e.model_dump() for e in reversed(events)]
+        return _json({"objective_id": objective_id, "count": len(chronological),
+                      "events": chronological})

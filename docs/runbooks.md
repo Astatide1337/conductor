@@ -49,6 +49,29 @@ curl -s -X POST localhost:8093/dry-run | jq .
 curl -s "localhost:8093/events?objective_id=$OBJ_ID&limit=20" | jq .
 ```
 
+### View full timeline
+
+```bash
+curl -s "localhost:8093/objectives/$OBJ_ID/timeline" | jq .
+```
+
+The timeline returns events in **chronological order** (oldest first) and
+includes everything that happened with the objective: `objective.created`,
+`task.created`, gateway checks, dispatches, reconciliations, approvals.
+Cockpits use this as the "What happened with objective X?" entry point.
+
+### List gateways + capabilities
+
+```bash
+curl -s localhost:8093/gateways | jq .
+curl -s localhost:8093/gateways/status | jq .
+# Live health probe
+curl -s -X POST localhost:8093/gateways/check-all | jq .
+# Capability search
+curl -s localhost:8093/capabilities | jq .
+curl -s localhost:8093/capabilities/execution.task.create | jq .
+```
+
 ## Startup
 
 ```bash
@@ -218,6 +241,87 @@ curl -s "localhost:8093/events?task_id=$TASK_ID" | \
 The event payload includes `original_status`, `validated_skills`, and
 `missing_skills` for forensic inspection.
 
+## Dispatch with capability validation
+
+A task may declare `required_capabilities` in its `metadata` (a JSON list of
+dotted capability strings). Conductor's Gateway Hub validates each
+required capability has at least one configured+enabled provider **before**
+any state transition.
+
+```bash
+# Create a task declaring required capabilities
+TASK=$(curl -s -X POST localhost:8093/objectives/$OBJ_ID/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title":"Bridge auth audit",
+    "required_skills":["code-review"],
+    "metadata":{"required_capabilities":["execution.task.create","external.github"]}
+  }')
+TASK_ID=$(echo $TASK | jq -r .id)
+
+# Dispatch — validates capabilities first
+RESP=$(curl -s -X POST localhost:8093/tasks/$TASK_ID/dispatch)
+echo "$RESP" | jq .
+```
+
+When capabilities are missing, `$RESP` looks like:
+```json
+{
+  "task_id": "...",
+  "status": "ready",
+  "agent_run": null,
+  "error": "missing required capabilities: ['external.github']",
+  "missing_capabilities": ["external.github"],
+  "degraded_capabilities": [],
+  "satisfied_capabilities": ["execution.task.create"]
+}
+```
+
+To inspect the failure:
+
+```bash
+curl -s "localhost:8093/events?task_id=$TASK_ID" | \
+  jq '.events[] | select(.event_type=="task.capabilities_validation_failed")'
+```
+
+To find candidate gateways for a capability:
+
+```bash
+curl -s localhost:8093/capabilities/external.github | jq .
+```
+
+To enable a missing capability, configure the corresponding gateway env
+var (e.g. `CONDUCTOR_MCP_GATEWAY__URL` to expose the `mcp` gateway
+which provides `external.github`).
+
+## Gateway hub health
+
+```bash
+# Lightweight snapshot — no live probes
+curl -s localhost:8093/gateways/status | jq .
+
+# Single live probe
+curl -s -X POST localhost:8093/gateways/agents/check | jq .
+
+# Probe everything
+curl -s -X POST localhost:8093/gateways/check-all | jq .
+```
+
+A `gateway.health_checked` (status=healthy) or `gateway.health_failed`
+(any other status) event is emitted on every user-triggered probe.
+
+Per-status interpretation:
+
+| Status | Meaning |
+|---|---|
+| `not_configured` | `base_url` is empty — set `CONDUCTOR_*__URL` env vars |
+| `disabled` | Gateway `enabled=False` — flip via config to enable |
+| `healthy` | `/health` returned 2xx |
+| `auth_failed` | `/health` returned 401 or 403 — token mismatch |
+| `timeout` | `/health` did not respond within `timeout_seconds` |
+| `unhealthy` | 5xx or other 4xx — server error or refused |
+| `error` | Unexpected client-side exception — inspect Conductor logs |
+
 ## MCP cockpit unauthorized
 
 If your MCP cockpit gets a `401` with this body:
@@ -241,7 +345,14 @@ that's the expected REST shape and is not a bug.
 
 ## Live E2E (production gateway)
 
-See `docs/live-e2e.md` for the full guide. Quick recipe:
+Two live E2E pathways:
+
+| Script | Scope |
+|---|---|
+| `scripts/e2e-live-agents.sh` | Agents + Skills Gateway |
+| `scripts/e2e-live-gateway-hub.sh` | Agents + Skills + MCP Gateway + optional wiki |
+
+Quick recipe for the full Gateway Hub live smoke:
 
 ```bash
 export CONDUCTOR_BASE_URL=http://conductor.astatide.com
@@ -250,7 +361,17 @@ export CONDUCTOR_INTERNAL_TOKEN=...
 export CONDUCTOR_AGENTS_GATEWAY_URL=http://agents.astatide.com
 export CONDUCTOR_AGENTS_GATEWAY_AUTH_MODE=internal-only
 export CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN=...
-bash scripts/e2e-live-agents.sh
+export CONDUCTOR_SKILLS_GATEWAY_URL=http://skills.astatide.com
+export CONDUCTOR_SKILLS_GATEWAY_AUTH_MODE=internal-only
+export CONDUCTOR_SKILLS_GATEWAY_INTERNAL_TOKEN=...
+export CONDUCTOR_MCP_GATEWAY_URL=http://mcp.astatide.com
+export CONDUCTOR_MCP_GATEWAY_AUTH_MODE=internal-only
+export CONDUCTOR_MCP_GATEWAY_INTERNAL_TOKEN=...
+# optional:
+export CONDUCTOR_WIKI_MCP_URL=http://wiki.astatide.com
+export CONDUCTOR_WIKI_MCP_AUTH_MODE=internal-only
+export CONDUCTOR_WIKI_MCP_INTERNAL_TOKEN=...
+bash scripts/e2e-live-gateway-hub.sh
 ```
 
 If env vars are missing, the script prints a clear blocker message and

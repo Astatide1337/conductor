@@ -156,6 +156,34 @@ CONDUCTOR_SKILLS_GATEWAY__AUTH_MODE=dev-none
 CONDUCTOR_SKILLS_GATEWAY__TIMEOUT_SECONDS=10
 ```
 
+### MCP Gateway (downstream capability provider)
+
+The MCP Gateway is one of Conductor's downstream gateways — Conductor
+connects **to** it. Cockpits never connect to the MCP Gateway directly; they
+connect to Conductor.
+
+```bash
+CONDUCTOR_MCP_GATEWAY__URL=https://mcp.astatide.com
+CONDUCTOR_MCP_GATEWAY__AUTH_MODE=internal-only
+CONDUCTOR_MCP_GATEWAY__INTERNAL_TOKEN=<token>
+CONDUCTOR_MCP_GATEWAY__TIMEOUT_SECONDS=10
+```
+
+When the URL is unset, the `mcp` gateway is still registered but reported
+as `not_configured` in `/gateways` so operators can see "what would become
+available if we enable this".
+
+### wiki-mcp (durable memory — optional)
+
+```bash
+CONDUCTOR_WIKI_MCP__URL=https://wiki.astatide.com
+CONDUCTOR_WIKI_MCP__AUTH_MODE=internal-only
+CONDUCTOR_WIKI_MCP__INTERNAL_TOKEN=<token>
+```
+
+Disabled by default. When configured, Conductor can read/write
+project context and durable memory.
+
 ## Auth + MCP
 
 The mounted `/mcp` sub-app is protected by the **same** auth middleware as
@@ -198,11 +226,44 @@ If unset, the Skills Gateway client is `None` and `required_skills` are
 silently skipped. This is acceptable for personal dev deployments but
 **not** for production.
 
+## Gateway hub
+
+Conductor is the single hub. The four canonical downstream gateways
+(agents, skills, mcp, wiki) are registered at startup. Health probes
+and capability lookup are exposed through HTTP `/gateways`,
+`/gateways/status`, `/gateways/check-all`, `/capabilities` endpoints and
+the corresponding MCP tools. See `docs/gateway-hub.md` for the full
+overview.
+
+Required env to enable the MCP Gateway downstream capability:
+
+```bash
+CONDUCTOR_MCP_GATEWAY__URL=https://mcp.astatide.com   # non-localhost URL
+CONDUCTOR_MCP_GATEWAY__AUTH_MODE=internal-only
+CONDUCTOR_MCP_GATEWAY__INTERNAL_TOKEN=<secret>
+```
+
+Optional wiki-mcp:
+
+```bash
+CONDUCTOR_WIKI_MCP__URL=https://wiki.astatide.com
+CONDUCTOR_WIKI_MCP__AUTH_MODE=internal-only
+CONDUCTOR_WIKI_MCP__INTERNAL_TOKEN=<secret>
+```
+
+If unset, Conductor reports the gateway as `not_configured` in
+`/gateways/status` instead of failing boot.
+
 ## Live E2E against real gateways
 
-The production smoke `scripts/e2e-live-agents.sh` exercises the full
-Conductor → Agents Gateway → Skills Gateway path. See
-[`docs/live-e2e.md`](live-e2e.md) for the env var checklist and
+Two live E2E pathways, both refusing to run without env vars:
+
+| Script | Scope | Required env |
+|---|---|---|
+| `scripts/e2e-live-agents.sh` | Agents Gateway + Skills Gateway | Conductor + Agents + Skills tokens |
+| `scripts/e2e-live-gateway-hub.sh` | Agents + Skills + MCP Gateway + optional wiki | Conductor + Agents + Skills + MCP tokens |
+
+See [`docs/live-e2e.md`](live-e2e.md) for the env var checklist and
 expected output.
 
 ```bash
@@ -212,7 +273,13 @@ export CONDUCTOR_INTERNAL_TOKEN=...
 export CONDUCTOR_AGENTS_GATEWAY_URL=http://agents.astatide.com
 export CONDUCTOR_AGENTS_GATEWAY_AUTH_MODE=internal-only
 export CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN=...
-bash scripts/e2e-live-agents.sh
+export CONDUCTOR_SKILLS_GATEWAY_URL=http://skills.astatide.com
+export CONDUCTOR_SKILLS_GATEWAY_AUTH_MODE=internal-only
+export CONDUCTOR_SKILLS_GATEWAY_INTERNAL_TOKEN=...
+export CONDUCTOR_MCP_GATEWAY_URL=http://mcp.astatide.com
+export CONDUCTOR_MCP_GATEWAY_AUTH_MODE=internal-only
+export CONDUCTOR_MCP_GATEWAY_INTERNAL_TOKEN=...
+bash scripts/e2e-live-gateway-hub.sh
 ```
 
 Exit codes: `0` success, `1` assertion failure, `2` missing required env vars.
