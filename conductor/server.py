@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from conductor import VERSION
-from conductor.auth import AuthHandler, _make_auth_middleware_cls
+from conductor.auth import AuthHandler, _make_auth_middleware_cls, make_mcp_auth_middleware_cls
 from conductor.config import ConductorConfig
 from conductor.events import emit, list_events as list_events_fn
 from conductor.logging import (
@@ -24,7 +24,43 @@ from conductor.metrics import MetricsRegistry, get_metrics_registry, init_conduc
 from conductor.models import ObjectiveCreate, TaskCreate
 from conductor.policy import check_action, check_decision
 from conductor.storage import ConductorStorage
-from conductor.clients.agents_gateway import MockAgentsGatewayClient
+from conductor.clients.agents_gateway import (
+    BaseAgentsGatewayClient,
+    HttpAgentsGatewayClient,
+    MockAgentsGatewayClient,
+)
+from conductor.clients.skills_gateway import (
+    BaseSkillsGatewayClient,
+    HttpSkillsGatewayClient,
+    MockSkillsGatewayClient,
+)
+
+
+def _build_gateway_client(cfg: ConductorConfig) -> BaseAgentsGatewayClient:
+    """Build the Agents Gateway client. Real HTTP when CONDUCTOR_AGENTS_GATEWAY_URL
+    is set to a non-localhost URL, otherwise a Mock client for offline dev/test.
+    Provides a shared configured agents gateway actor to the HTTP routes + MCP tools,
+    so dispatch and reconcile use the same gateway instance."""
+    gw_cfg = cfg.agents_gateway
+    if gw_cfg.url and gw_cfg.auth_mode != "dev-none" and not _is_localhost_url(gw_cfg.url):
+        return HttpAgentsGatewayClient(gw_cfg)
+    # Mock for offline / dev
+    mock = MockAgentsGatewayClient()
+    mock.register_agent("code-validator", "Code Validator")
+    return mock
+
+
+def _build_skills_client(cfg: ConductorConfig) -> BaseSkillsGatewayClient | None:
+    sk_cfg = cfg.skills_gateway
+    if sk_cfg.url and sk_cfg.auth_mode != "dev-none" and not _is_localhost_url(sk_cfg.url):
+        return HttpSkillsGatewayClient(sk_cfg)
+    # None means "skills validation is a no-op" — falls back to "all skills valid"
+    # In dev / offline we register nothing, so the dry-run will note missing skills.
+    return None
+
+
+def _is_localhost_url(url: str) -> bool:
+    return "://localhost" in url or "://127.0.0.1" in url or "://0.0.0.0" in url
 
 try:
     from fastmcp import FastMCP
@@ -61,6 +97,8 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
     app.state.storage = storage
     app.state.auth = auth_handler
     app.state.metrics = metrics_reg
+    app.state.gateway_client = _build_gateway_client(cfg)
+    app.state.skills_client = _build_skills_client(cfg)
 
     # Middleware
     AuthMw = _make_auth_middleware_cls(auth_handler)
@@ -232,10 +270,13 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
     @app.post("/tasks/{task_id}/dispatch")
     async def dispatch_route(task_id: str, request: Request):
         from conductor.dispatch import dispatch_task as do_dispatch
-        mock = MockAgentsGatewayClient()
-        mock.register_agent("code-validator", "Code Validator")
         try:
-            result = do_dispatch(app.state.storage, mock, task_id)
+            result = do_dispatch(
+                app.state.storage,
+                app.state.gateway_client,
+                task_id,
+                skills_client=app.state.skills_client,
+            )
             return JSONResponse(result, status_code=200)
         except Exception as e:
             raise HTTPException(500, f"Dispatch failed: {e}")
@@ -274,7 +315,9 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
 
     @app.post("/reconcile")
     async def reconcile(request: Request):
-        raise HTTPException(501, "reconcile not implemented — milestone 6")
+        from conductor.dispatch import reconcile_all
+        summary = reconcile_all(app.state.storage, app.state.gateway_client)
+        return JSONResponse(summary, status_code=200)
 
     # ── Protected routes: Dry run ────────────────────────────────────────
 
@@ -324,10 +367,6 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
 
         mcp_server = FastMCP("Astatide Conductor", instructions="Persistent objective orchestrator for MCP-driven agent workflows.")
 
-        skills_mock = None  # Real client only when configured
-        gw_mock = MockAgentsGatewayClient()
-        gw_mock.register_agent("code-validator", "Code Validator")
-
         b_evaluator = BreakerEvaluator(
             storage,
             max_iterations=cfg.circuit.max_iterations_per_run,
@@ -338,9 +377,16 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
             max_stall=cfg.circuit.max_stall_minutes,
         )
 
-        register_conductor_tools(mcp_server, cfg, storage, b_evaluator, skills_mock, gw_mock)
+        register_conductor_tools(
+            mcp_server, cfg, storage, b_evaluator,
+            app.state.skills_client, app.state.gateway_client,
+        )
 
         mcp_asgi = mcp_server.http_app(path=cfg.service.mcp_path)
+        # Wrap MCP sub-app in the same auth model as the rest of Conductor.
+        # No public paths on /mcp — any cockpit must identify itself via internal token or CF JWT.
+        MCPAuthMw = make_mcp_auth_middleware_cls(auth_handler)
+        mcp_asgi.add_middleware(MCPAuthMw)
         app.mount(cfg.service.mcp_path, mcp_asgi)
 
     return app

@@ -81,26 +81,30 @@ class AuthHandler:
         return AuthResult(allowed=False, mode=self.mode, error="unknown auth mode")
 
 
+def _check_request_auth(auth_handler: AuthHandler, request: Request) -> AuthResult | None:
+    """Run an auth check against the request. Returns None for public paths, else AuthResult."""
+    path = request.url.path
+    if path in PUBLIC_PATHS or any(path.startswith(p) for p in OAUTH_PATHS):
+        return None
+    client_host = request.client.host if request.client else "unknown"
+    internal_token = request.headers.get("X-Auth-Internal-Token")
+    cf_jwt = request.headers.get("Cf-Access-Jwt-Assertion")
+    return auth_handler.check(client_host, internal_token=internal_token, cf_jwt=cf_jwt)
+
+
 def _make_auth_middleware_cls(auth_handler: AuthHandler):
     class _AuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next) -> Response:
             rid = str(uuid.uuid4())
             request_id_var.set(rid)
 
-            # Skip auth for public paths
-            path = request.url.path
-            if path in PUBLIC_PATHS or any(path.startswith(p) for p in OAUTH_PATHS):
+            result = _check_request_auth(auth_handler, request)
+            if result is None:
                 try:
                     response = await call_next(request)
                     return response
                 finally:
                     clear_request_context()
-
-            client_host = request.client.host if request.client else "unknown"
-            internal_token = request.headers.get("X-Auth-Internal-Token")
-            cf_jwt = request.headers.get("Cf-Access-Jwt-Assertion")
-
-            result = auth_handler.check(client_host, internal_token=internal_token, cf_jwt=cf_jwt)
 
             if not result.allowed:
                 clear_request_context()
@@ -118,3 +122,36 @@ def _make_auth_middleware_cls(auth_handler: AuthHandler):
                 clear_request_context()
 
     return _AuthMiddleware
+
+
+def make_mcp_auth_middleware_cls(auth_handler: AuthHandler):
+    """Middleware for mounted MCP sub-apps. All MCP traffic requires auth — no public paths.
+
+    Disallows unauthenticated initialize / tools/list / tool calls. The cockpit must
+    identify itself the same way HTTP API callers do (internal token or CF JWT).
+    """
+    class _MCPAuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next) -> Response:
+            rid = str(uuid.uuid4())
+            request_id_var.set(rid)
+
+            client_host = request.client.host if request.client else "unknown"
+            internal_token = request.headers.get("X-Auth-Internal-Token")
+            cf_jwt = request.headers.get("Cf-Access-Jwt-Assertion")
+            result = auth_handler.check(client_host, internal_token=internal_token, cf_jwt=cf_jwt)
+
+            if not result.allowed:
+                clear_request_context()
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "error": {"code": -32001, "message": result.error or "Authentication required"}},
+                    status_code=401,
+                )
+
+            bind_request_context(rid, auth_subject=result.user)
+            try:
+                response = await call_next(request)
+                return response
+            finally:
+                clear_request_context()
+
+    return _MCPAuthMiddleware

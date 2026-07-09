@@ -57,6 +57,8 @@ class TestMCPToolsList:
             "conductor_resume_objective",
             "conductor_cancel_objective",
             "conductor_dry_run",
+            "conductor_reconcile",
+            "conductor_view_events",
             "conductor_health_check",
         }
         missing = expected - names
@@ -168,3 +170,19 @@ class TestMCPToolCalls:
         result = await _call(mcp, "conductor_dry_run", objective_id=obj_id)
         data = json.loads(result)
         assert "would_dispatch" in data
+
+    async def test_view_events(self, mcp_state):
+        mcp, storage = mcp_state
+        await _call(mcp, "conductor_create_objective", title="Evts")
+        result = await _call(mcp, "conductor_view_events")
+        data = json.loads(result)
+        assert "events" in data
+        assert data["count"] >= 1  # objective.created event was emitted
+
+    async def test_reconcile(self, mcp_state):
+        mcp, storage = mcp_state
+        result = await _call(mcp, "conductor_reconcile")
+        data = json.loads(result)
+        # No in-flight agent_runs in this fresh state — should return 0 reconciles
+        assert data["candidate_count"] == 0
+        assert data["reconciled"] == 0

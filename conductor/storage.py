@@ -503,6 +503,33 @@ class ConductorStorage:
             ).fetchone()
         return self._row_to_agent_run(row) if row else None
 
+    INFIGHT_AGENT_RUN_STATUSES = ("dispatched", "queued", "running", "lost")
+
+    def list_inflight_agent_runs(self, statuses: tuple[str, ...] | None = None) -> list[dict]:
+        """Return agent_runs whose status indicates work may still be happening remotely.
+
+        Used by the reconciliation service to find candidates for polling the gateway
+        after a Conductor restart. Defaults to the in-flight set; pass an explicit
+        tuple to broaden (e.g. to include "lost" recovery candidates).
+        """
+        sts = statuses or self.INFIGHT_AGENT_RUN_STATUSES
+        placeholders = ",".join("?" * len(sts))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM agent_runs WHERE status IN ({placeholders}) ORDER BY started_at ASC",
+                tuple(sts),
+            ).fetchall()
+        return [self._row_to_agent_run(r) for r in rows]
+
+    def set_agent_run_artifacts(self, agent_run_id: str, artifact_refs: list[dict]) -> None:
+        """Persist artifact references ingested from the gateway into artifact_refs_json."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE agent_runs SET artifact_refs_json = ? WHERE id = ?",
+                (json.dumps(artifact_refs), agent_run_id),
+            )
+            conn.commit()
+
     def update_agent_run_status(self, agent_run_id: str, target: str) -> dict | None:
         current = self.get_agent_run(agent_run_id)
         if not current:

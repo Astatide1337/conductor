@@ -28,6 +28,10 @@ def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway
         metadata = json.loads(metadata_json) if metadata_json else {}
         obj = storage.create_objective(title=title, description=description, priority=priority, metadata=metadata)
         run = storage.create_run(obj["id"], planner_mode=cfg.planner.mode)
+        # Emit the objective.created event so cockpit audit views show what the HTTP API shows
+        from conductor.events import emit
+        emit(storage, "objective.created", f"Objective '{title}' created",
+             objective_id=obj["id"], run_id=run["id"], source="mcp-user")
         return _json({"objective_id": obj["id"], "run_id": run["id"], "status": obj["status"]})
 
     @mcp.tool()
@@ -119,7 +123,7 @@ def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway
         """Dispatch a task to Agents Gateway."""
         from conductor.dispatch import dispatch_task as do_dispatch
         try:
-            result = do_dispatch(storage, gateway_client, task_id)
+            result = do_dispatch(storage, gateway_client, task_id, skills_client=skills_client)
             return _json({"agent_run": result, "status": result["status"]})
         except Exception as e:
             return _json({"error": str(e), "task_id": task_id})
@@ -221,6 +225,32 @@ def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway
 
         result = run_dry_run(storage, run_id, breakers, skills_client=skills_client)
         return _json(result.model_dump())
+
+    @mcp.tool()
+    async def conductor_reconcile() -> str:
+        """Reconcile Conductor's view of in-flight agent_runs with the Agents Gateway.
+
+        Safe to call anytime. Used after Conductor restart to recover durable state.
+        Returns a summary: {reconciled, transitions, errors, candidate_count}.
+        """
+        from conductor.dispatch import reconcile_all
+        summary = reconcile_all(storage, gateway_client)
+        return _json(summary)
+
+    @mcp.tool()
+    async def conductor_view_events(
+        objective_id: str = "",
+        run_id: str = "",
+        task_id: str = "",
+        limit: int = 25,
+    ) -> str:
+        """View append-only audit events for an objective/run/task."""
+        from conductor.events import list_events
+        obj_id = objective_id or None
+        r_id = run_id or None
+        t_id = task_id or None
+        events = list_events(storage, objective_id=obj_id, run_id=r_id, task_id=t_id, limit=limit)
+        return _json({"events": [e.model_dump() for e in events], "count": len(events)})
 
     @mcp.tool()
     async def conductor_health_check() -> str:

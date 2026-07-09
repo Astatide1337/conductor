@@ -220,9 +220,12 @@ class TestApprovalsAPI:
 
 
 class TestReconcileAndDryRun:
-    def test_reconcile_501(self, client):
+    def test_reconcile_200(self, client):
         r = client.post("/reconcile")
-        assert r.status_code == 501
+        assert r.status_code == 200
+        body = r.json()
+        assert "candidate_count" in body
+        assert "reconciled" in body
 
     def test_dry_run_200(self, client):
         r = client.post("/dry-run")
