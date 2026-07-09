@@ -149,3 +149,109 @@ Delete it for a completely fresh state:
 ```bash
 rm -f data/conductor.db
 ```
+
+## Reconciliation after restart
+
+Conductor is durable: state lives in SQLite. After a crash/restart, agent
+runs left in `dispatched` / `queued` / `running` / `lost` need to be polled
+against the Agents Gateway to discover terminal state.
+
+```bash
+curl -s -X POST localhost:8093/reconcile | jq .
+```
+
+Response:
+```json
+{
+  "reconciled": 4,
+  "transitions": 2,
+  "errors": 0,
+  "by_target": {"completed": 1, "failed": 1},
+  "candidate_count": 4
+}
+```
+
+- `transitions > 0` means async work happened on the gateway side while
+  Conductor was down — good, that's what the recovery is for.
+- `errors > 0` means the gateway was unreachable or returned a malformed
+  response — inspect Conductor logs for `reconcile_error` lines.
+
+Safe to call repeatedly. Reconcile also ingests any artifacts the gateway
+has produced, idempotently (artifact de-dup by id).
+
+## Dispatch with skills validation
+
+```bash
+# Create a task declaring required skills
+TASK=$(curl -s -X POST localhost:8093/objectives/$OBJ_ID/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Build auth","required_skills":["code-review","git-tools"]}')
+TASK_ID=$(echo $TASK | jq -r .id)
+
+# Dispatch — validates skills first
+RESP=$(curl -s -X POST localhost:8093/tasks/$TASK_ID/dispatch)
+echo "$RESP" | jq .
+```
+
+When skills are missing, `$RESP` looks like:
+```json
+{
+  "task_id": "...",
+  "status": "ready",        // unchanged
+  "agent_run": null,        // no row created
+  "error": "missing required skills: ['code-review']",
+  "missing_skills": ["code-review"]
+}
+```
+
+The task remains in its original state. Re-dispatch after registering the
+missing skill with the Skills Gateway, or retag the task with skills that
+exist.
+
+### Inspecting the failure event
+
+```bash
+curl -s "localhost:8093/events?task_id=$TASK_ID" | \
+  jq '.events[] | select(.event_type=="task.skills_validation_failed")'
+```
+
+The event payload includes `original_status`, `validated_skills`, and
+`missing_skills` for forensic inspection.
+
+## MCP cockpit unauthorized
+
+If your MCP cockpit gets a `401` with this body:
+
+```json
+{"jsonrpc":"2.0","error":{"code":-32001,"message":"missing internal token"},"id":null}
+```
+
+it means the cockpit is missing the auth header. This is the same check the
+REST API performs; there is no separate MCP auth bypass path.
+
+| Mode | Required header |
+|---|---|
+| `dev-none` | none (dev only) |
+| `internal-only` | `X-Auth-Internal-Token: <CONDUCTOR_AUTH__INTERNAL_SECRET>` |
+| `cloudflare-access` | `Cf-Access-Jwt-Assertion: <jwt>` (or the internal token bypass) |
+
+The body shape (`jsonrpc` + `error.code == -32001`) is intentional so MCP
+clients can parse the error. REST endpoints will return `{"detail": "..."}` —
+that's the expected REST shape and is not a bug.
+
+## Live E2E (production gateway)
+
+See `docs/live-e2e.md` for the full guide. Quick recipe:
+
+```bash
+export CONDUCTOR_BASE_URL=http://conductor.astatide.com
+export CONDUCTOR_AUTH_MODE=internal-only
+export CONDUCTOR_INTERNAL_TOKEN=...
+export CONDUCTOR_AGENTS_GATEWAY_URL=http://agents.astatide.com
+export CONDUCTOR_AGENTS_GATEWAY_AUTH_MODE=internal-only
+export CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN=...
+bash scripts/e2e-live-agents.sh
+```
+
+If env vars are missing, the script prints a clear blocker message and
+exits 2 — it will never fake a live run.

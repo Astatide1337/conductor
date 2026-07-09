@@ -87,8 +87,31 @@ Response (200):
 
 | Method | Path | Status | Description |
 |---|---|---|---|
-| POST | `/reconcile` | 501 | Not yet implemented |
+| POST | `/reconcile` | 200 | Reconcile all in-flight agent_runs against the Agents Gateway |
 | POST | `/dry-run` | 200 | Deterministic dry-run analysis |
+
+```bash
+curl -X POST http://localhost:8093/reconcile
+```
+
+Response (200):
+```json
+{
+  "reconciled": 4,
+  "transitions": 2,
+  "errors": 0,
+  "by_target": {"completed": 1, "failed": 1},
+  "candidate_count": 4
+}
+```
+
+- `reconciled` — agent_runs for which the reconcile call succeeded (success or
+  no-op).
+- `transitions` — count whose `status` actually changed.
+- `errors` — reconcile_task exceptions (e.g., gateway unreachable). Each
+  failure increments `conductor_reconciliation_errors_total`.
+- `by_target` — histogram of post-reconcile statuses.
+- `candidate_count` — number of in-flight agent_runs considered.
 
 ### Dry run
 
@@ -107,6 +130,31 @@ Response (200):
 }
 ```
 
+## Dispatch — skill validation gate
+
+`POST /tasks/{id}/dispatch` validates `required_skills` against the
+configured Skills Gateway **before** any state transition, agent_run row, or
+gateway call.
+
+If skills are missing, the caller receives a **structured error** (still
+HTTP 200) and the task is left in its original state. No `agent_run` row is
+created. The Agents Gateway is never called.
+
+Response when skills are missing (200):
+```json
+{
+  "task_id": "uuid",
+  "status": "ready",
+  "agent_run": null,
+  "error": "missing required skills: ['never-exists']",
+  "missing_skills": ["never-exists"],
+  "validated_skills": ["pytest-mcp"]
+}
+```
+
+The `task.skills_validation_failed` event is emitted with `payload.original_status`
+and `payload.missing_skills`.
+
 ## Authentication
 
 Protected routes require one of:
@@ -116,3 +164,35 @@ Protected routes require one of:
 - `cloudflare-access` mode — `Cf-Access-Jwt-Assertion: <jwt>` header
 
 Public routes: `/health`, `/ready`, `/version` never require auth.
+
+## MCP cockpit surface at `/mcp`
+
+The MCP path exposes Conductor's high-level cockpit tools (see
+`conductor/mcp_tools.py`). The auth model is the same as the REST API:
+
+- Unauthenticated requests return `401` **with a JSON-RPC 2.0 envelope**:
+  ```json
+  {"jsonrpc":"2.0","error":{"code":-32001,"message":"missing internal token"},"id":null}
+  ```
+  This is distinct from unauthenticated REST traffic, which returns
+  `{"detail": "..."}` — a deliberate choice so MCP cockpits can parse
+  rejections cleanly.
+- Authenticated requests proceed normally; `initialize`, `tools/list`, and
+  `tools/call` all require the same auth header(s) as REST.
+
+The full tool list:
+
+| Tool | Description |
+|---|---|
+| `conductor_create_objective` | Create an objective + initial run |
+| `conductor_get_objective` | Get objective with runs |
+| `conductor_list_objectives` | List objectives (filters: `?status=`, `?limit=`) |
+| `conductor_get_status` | Comprehensive status (objective/run/tasks/approvals/circuit-breakers) |
+| `conductor_create_task` | Create a task under an objective's active run |
+| `conductor_dispatch_task` | Dispatch a task via the shared Agents Gateway client (with skill validation) |
+| `conductor_list_approvals` | List pending approvals |
+| `conductor_approve` | Approve a pending approval |
+| `conductor_reject` | Reject a pending approval |
+| `conductor_reconcile` | Run reconciliation against the Agents Gateway |
+| `conductor_view_events` | Inspect events with `objective_id`/`run_id`/`task_id`/`limit` filters |
+| plus: `conductor_pause_objective`, `conductor_resume_objective`, `conductor_cancel_objective`, `conductor_get_objective_status`, `conductor_dry_run`, `conductor_health` | (legacy/utility tools) |

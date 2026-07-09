@@ -14,7 +14,7 @@ def _json(obj) -> str:
     return json.dumps(obj, indent=2, default=str) if not isinstance(obj, str) else obj
 
 
-def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway_client):
+def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway_client, metrics=None):
     """Register all conductor MCP tools on a FastMCP server instance."""
 
     @mcp.tool()
@@ -123,7 +123,10 @@ def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway
         """Dispatch a task to Agents Gateway."""
         from conductor.dispatch import dispatch_task as do_dispatch
         try:
-            result = do_dispatch(storage, gateway_client, task_id, skills_client=skills_client)
+            result = do_dispatch(
+                storage, gateway_client, task_id,
+                skills_client=skills_client, metrics=metrics,
+            )
             return _json({"agent_run": result, "status": result["status"]})
         except Exception as e:
             return _json({"error": str(e), "task_id": task_id})
@@ -234,7 +237,7 @@ def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway
         Returns a summary: {reconciled, transitions, errors, candidate_count}.
         """
         from conductor.dispatch import reconcile_all
-        summary = reconcile_all(storage, gateway_client)
+        summary = reconcile_all(storage, gateway_client, metrics=metrics)
         return _json(summary)
 
     @mcp.tool()

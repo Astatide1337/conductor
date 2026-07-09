@@ -64,18 +64,71 @@ class TestDispatchSkillsValidationGate:
         )
         s.update_task_status(task["id"], "ready")
         result = dispatch_task(s, gw, task["id"], skills_client=sk)
-        assert result["status"] == "blocked"
+        # Per the new contract: missing skills -> NO state transition, NO agent_run.
+        # Task remains in its original status ("ready"); return is a structured error.
+        assert result["status"] == "ready"
         assert result.get("agent_run") is None
         assert "nonexistent-skill" in result["missing_skills"]
 
-        # Task should now be in blocked status
+        # Task should remain in its original "ready" status — never entered dispatched/running.
         t = s.get_task(task["id"])
-        assert t["status"] == "blocked"
+        assert t["status"] == "ready"
 
-        # An event should have been emitted
+        # An event should have been emitted: task.skills_validation_failed
         from conductor.events import list_events
         evts = list_events(s, task_id=task["id"], limit=10)
-        assert any(e.event_type == "dispatch.skills_missing" for e in evts)
+        assert any(e.event_type == "task.skills_validation_failed" for e in evts)
+
+    def test_dispatch_blocked_on_missing_skill_does_not_call_gateway(self, storage_gw_skills):
+        """A missing required skill must never reach the Agents Gateway."""
+        s, gw, sk = storage_gw_skills
+        obj = s.create_objective(title="NeedSkills2")
+        run = s.create_run(obj["id"])
+        task = s.create_task(
+            obj["id"], run["id"], "Task with skills",
+            required_skills=["pytest-mcp", "never-exists"],
+        )
+        s.update_task_status(task["id"], "ready")
+        before_task_count = len(gw._tasks)
+        dispatch_task(s, gw, task["id"], skills_client=sk)
+        # No task was created on the gateway side
+        assert len(gw._tasks) == before_task_count
+
+    def test_dispatch_blocked_on_missing_skill_does_not_create_agent_run(self, storage_gw_skills):
+        """A missing required skill must not create an agent_run row."""
+        s, gw, sk = storage_gw_skills
+        obj = s.create_objective(title="NeedSkills3")
+        run = s.create_run(obj["id"])
+        task = s.create_task(
+            obj["id"], run["id"], "Task with skills",
+            required_skills=["never-exists"],
+        )
+        s.update_task_status(task["id"], "ready")
+        # No agent_runs exist before
+        assert len(s.list_inflight_agent_runs()) == 0
+        dispatch_task(s, gw, task["id"], skills_client=sk)
+        # Still none after — we never inserted an agent_run row
+        assert len(s.list_inflight_agent_runs()) == 0
+
+    def test_dispatch_blocked_emits_event_with_payload(self, storage_gw_skills):
+        """The skills_validation_failed event should include the missing skills in payload."""
+        s, gw, sk = storage_gw_skills
+        obj = s.create_objective(title="NeedSkills4")
+        run = s.create_run(obj["id"])
+        task = s.create_task(
+            obj["id"], run["id"], "Skills event",
+            required_skills=["pytest-mcp", "ghost"],
+        )
+        s.update_task_status(task["id"], "ready")
+        dispatch_task(s, gw, task["id"], skills_client=sk)
+        from conductor.events import list_events
+        evts = list_events(s, task_id=task["id"], limit=20)
+        skill_evts = [e for e in evts if e.event_type == "task.skills_validation_failed"]
+        assert skill_evts, "expected a task.skills_validation_failed event"
+        e = skill_evts[-1]
+        assert "ghost" in e.payload.get("missing_skills", [])
+        # Original status is preserved for forensic inspection
+        assert e.payload.get("original_status") == "ready"
 
     def test_dispatch_passes_when_skills_available(self, storage_gw_skills):
         s, gw, sk = storage_gw_skills

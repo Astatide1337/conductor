@@ -156,6 +156,67 @@ CONDUCTOR_SKILLS_GATEWAY__AUTH_MODE=dev-none
 CONDUCTOR_SKILLS_GATEWAY__TIMEOUT_SECONDS=10
 ```
 
+## Auth + MCP
+
+The mounted `/mcp` sub-app is protected by the **same** auth middleware as
+the REST API. There is no special-cased auth path for MCP.
+
+Behavior on failure differs by surface so MCP cockpits can parse the
+rejection:
+
+| Surface | 401 body shape |
+|---|---|
+| REST (`/objectives`, `/tasks`, ...) | `{"detail": "..."}` (FastAPI default) |
+| MCP (`/mcp`, `/mcp/*`) | `{"jsonrpc":"2.0","error":{"code":-32001,"message":"..."},"id":null}` |
+
+Both cases are HTTP `401`. The MCP shape is intentional — JSON-RPC 2.0
+clients cannot make sense of the FastAPI `{"detail":...}` envelope.
+
+In `dev-none` mode, neither surface enforces auth (dev only).
+In `internal-only` mode, both require `X-Auth-Internal-Token`.
+In `cloudflare-access` mode, both require either a Cloudflare Access JWT
+or an internal bypass token.
+
+## Skill validation before dispatch
+
+`POST /tasks/{id}/dispatch` validates `required_skills` against the
+configured Skills Gateway **before** any state transition or gateway call.
+If skills are missing, dispatch fails fast: no `agent_run` is created, the
+Agents Gateway is not contacted, and the task remains in its original
+state. See `docs/api.md#dispatch--skill-validation-gate` for the response
+shape.
+
+Required env to enable skill validation in production:
+
+```bash
+CONDUCTOR_SKILLS_GATEWAY__URL=http://skills-gateway:8091   # non-localhost URL
+CONDUCTOR_SKILLS_GATEWAY__AUTH_MODE=internal-only
+CONDUCTOR_SKILLS_GATEWAY__INTERNAL_TOKEN=<secret>
+```
+
+If unset, the Skills Gateway client is `None` and `required_skills` are
+silently skipped. This is acceptable for personal dev deployments but
+**not** for production.
+
+## Live E2E against real gateways
+
+The production smoke `scripts/e2e-live-agents.sh` exercises the full
+Conductor → Agents Gateway → Skills Gateway path. See
+[`docs/live-e2e.md`](live-e2e.md) for the env var checklist and
+expected output.
+
+```bash
+export CONDUCTOR_BASE_URL=http://conductor.astatide.com
+export CONDUCTOR_AUTH_MODE=internal-only
+export CONDUCTOR_INTERNAL_TOKEN=...
+export CONDUCTOR_AGENTS_GATEWAY_URL=http://agents.astatide.com
+export CONDUCTOR_AGENTS_GATEWAY_AUTH_MODE=internal-only
+export CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN=...
+bash scripts/e2e-live-agents.sh
+```
+
+Exit codes: `0` success, `1` assertion failure, `2` missing required env vars.
+
 ## Production boot assertions
 
 The application refuses to start with unsafe configs:

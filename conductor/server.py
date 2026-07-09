@@ -100,8 +100,9 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
     app.state.gateway_client = _build_gateway_client(cfg)
     app.state.skills_client = _build_skills_client(cfg)
 
-    # Middleware
-    AuthMw = _make_auth_middleware_cls(auth_handler)
+    # Middleware — outer middleware handles /mcp with JSON-RPC-shaped errors
+    # (sub-app middleware below is defense-in-depth).
+    AuthMw = _make_auth_middleware_cls(auth_handler, mcp_path=cfg.service.mcp_path)
     app.add_middleware(AuthMw)
 
     # ── Public routes ──────────────────────────────────────────────────
@@ -276,6 +277,7 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
                 app.state.gateway_client,
                 task_id,
                 skills_client=app.state.skills_client,
+                metrics=app.state.metrics,
             )
             return JSONResponse(result, status_code=200)
         except Exception as e:
@@ -316,7 +318,11 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
     @app.post("/reconcile")
     async def reconcile(request: Request):
         from conductor.dispatch import reconcile_all
-        summary = reconcile_all(app.state.storage, app.state.gateway_client)
+        summary = reconcile_all(
+            app.state.storage,
+            app.state.gateway_client,
+            metrics=app.state.metrics,
+        )
         return JSONResponse(summary, status_code=200)
 
     # ── Protected routes: Dry run ────────────────────────────────────────
@@ -380,6 +386,7 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         register_conductor_tools(
             mcp_server, cfg, storage, b_evaluator,
             app.state.skills_client, app.state.gateway_client,
+            metrics=app.state.metrics,
         )
 
         mcp_asgi = mcp_server.http_app(path=cfg.service.mcp_path)

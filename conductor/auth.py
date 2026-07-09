@@ -92,7 +92,26 @@ def _check_request_auth(auth_handler: AuthHandler, request: Request) -> AuthResu
     return auth_handler.check(client_host, internal_token=internal_token, cf_jwt=cf_jwt)
 
 
-def _make_auth_middleware_cls(auth_handler: AuthHandler):
+def _mcp_error_body(message: str) -> dict:
+    """Canonical JSON-RPC 2.0 server-error response for unauthorized MCP traffic.
+
+    Shaped so MCP cockpits can parse -32001 (a reserved pre-defined server-error
+    range) instead of receiving an opaque FastAPI 401 detail.
+    """
+    return {"jsonrpc": "2.0", "error": {"code": -32001, "message": message}, "id": None}
+
+
+def _make_auth_middleware_cls(auth_handler: AuthHandler, *, mcp_path: str = "/mcp"):
+    """HTTP auth middleware shared by all routes including /mcp.
+
+    Any request whose path lives under the MCP mount is auth-checked by the same
+    rule as the rest of Conductor. On failure /mcp responses are reshaped into
+    JSON-RPC 2.0 error envelopes so MCP clients see a parseable rejection, while
+    other paths keep the standard FastAPI {"detail": ...} shape for tooling.
+    """
+    # Normalize trailing slash once: /mcp and /mcp/ both fall under the prefix.
+    mcp_prefix = mcp_path.rstrip("/") + "/"
+
     class _AuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next) -> Response:
             rid = str(uuid.uuid4())
@@ -108,13 +127,19 @@ def _make_auth_middleware_cls(auth_handler: AuthHandler):
 
             if not result.allowed:
                 clear_request_context()
+                path = request.url.path
+                # /mcp/* -> JSON-RPC error envelope
+                if path.rstrip("/") == mcp_path.rstrip("/") or path.startswith(mcp_prefix):
+                    return JSONResponse(
+                        _mcp_error_body(result.error or "Unauthorized"),
+                        status_code=401,
+                    )
                 return JSONResponse(
                     {"detail": result.error or "Authentication required"},
                     status_code=401,
                 )
 
             bind_request_context(rid, auth_subject=result.user)
-
             try:
                 response = await call_next(request)
                 return response
@@ -124,11 +149,12 @@ def _make_auth_middleware_cls(auth_handler: AuthHandler):
     return _AuthMiddleware
 
 
-def make_mcp_auth_middleware_cls(auth_handler: AuthHandler):
-    """Middleware for mounted MCP sub-apps. All MCP traffic requires auth — no public paths.
+def make_mcp_auth_middleware_cls(auth_handler: AuthHandler, *, mcp_path: str = "/mcp"):
+    """Standalone MCP-only auth middleware (kept for defense in depth).
 
-    Disallows unauthenticated initialize / tools/list / tool calls. The cockpit must
-    identify itself the same way HTTP API callers do (internal token or CF JWT).
+    Used on the sub-app when MCP is mounted; produces JSON-RPC errors on
+    failure. The parent FastAPI middleware already enforces the same model, so
+    this rarely fires in practice but protects against future routing changes.
     """
     class _MCPAuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next) -> Response:
@@ -143,7 +169,7 @@ def make_mcp_auth_middleware_cls(auth_handler: AuthHandler):
             if not result.allowed:
                 clear_request_context()
                 return JSONResponse(
-                    {"jsonrpc": "2.0", "error": {"code": -32001, "message": result.error or "Authentication required"}},
+                    _mcp_error_body(result.error or "Unauthorized"),
                     status_code=401,
                 )
 

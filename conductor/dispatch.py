@@ -33,43 +33,63 @@ def dispatch_task(
     dispatch_profile: str = "",
     attempt: int = 1,
     skills_client: BaseSkillsGatewayClient | None = None,
+    metrics=None,
 ) -> dict:
     task = storage.get_task(task_id)
     if not task:
         raise DispatchError(f"Task {task_id} not found")
 
-    # Skills validation gate — tasks declare required_skills in their schema;
-    # before any work leaves Conductor, the Skills Gateway must confirm those skills exist.
-    # In dev with no skills_client configured, this is a no-op.
+    # ── Skills validation gate — runs BEFORE any state transition. ───────────
+    # Required skills are validated against the Skills Gateway; if any are
+    # missing, we refuse to dispatch entirely and leave the task in its
+    # original state (no spurious created→ready→dispatched→running→blocked).
+    # No agent_run row is created, no Agents Gateway call is made.
     if skills_client is not None:
         from conductor.clients.skills_gateway import validate_required_skills
         required = task.get("required_skills") or []
         valid, _, missing = validate_required_skills(skills_client, required)
         if missing:
-            logger.warning("dispatch_skills_missing task_id=%s missing=%s", task_id, missing)
-            emit(storage, "dispatch.skills_missing",
-                 f"Task {task_id} missing required skills: {missing}",
-                 objective_id=task["objective_id"], run_id=task["run_id"],
-                 task_id=task_id, source="conductor")
-            # Mark task blocked if the state machine permits it; we may be at
-            # either "created" or "ready" — only "running -> blocked" is valid,
-            # so we walk forward through dispatched/running first if needed.
-            try:
-                cur = storage.get_task(task_id)
-                if cur and cur["status"] in ("created", "ready"):
-                    storage.update_task_status(task_id, "dispatched")
-                    storage.update_task_status(task_id, "running")
-                    storage.update_task_status(task_id, "blocked")
-            except Exception:
-                pass
-            task = storage.get_task(task_id)
+            logger.warning(
+                "dispatch_skills_missing task_id=%s missing=%s original_status=%s",
+                task_id, missing, task["status"],
+            )
+            emit(
+                storage, "task.skills_validation_failed",
+                f"Task {task_id} missing required skills: {missing}",
+                objective_id=task["objective_id"], run_id=task["run_id"],
+                task_id=task_id, source="conductor",
+                payload={"missing_skills": missing, "validated": valid,
+                         "original_status": task["status"]},
+            )
+            if metrics:
+                metrics.inc("conductor_dispatch_errors_total")
+            # Task remains in original state (created or ready). Return structured
+            # error without creating an agent_run or calling the gateway.
             return {
                 "task_id": task_id,
                 "status": task["status"],
                 "agent_run": None,
                 "error": f"missing required skills: {missing}",
                 "missing_skills": missing,
+                "validated_skills": valid,
             }
+        else:
+            emit(
+                storage, "task.skills_validated",
+                f"Task {task_id} required skills validated: {valid}",
+                objective_id=task["objective_id"], run_id=task["run_id"],
+                task_id=task_id, source="conductor",
+                payload={"validated_skills": valid},
+            )
+
+    # ── Dispatch requested — fires after the gate passes (or no skills_client). ──
+    emit(
+        storage, "task.dispatch_requested",
+        f"Dispatch requested for task {task_id} attempt {attempt}",
+        objective_id=task["objective_id"], run_id=task["run_id"],
+        task_id=task_id, source="conductor",
+        payload={"attempt": attempt, "agent_id": agent_id},
+    )
 
     idem_key = build_idempotency_key(task["objective_id"], task["run_id"], task_id, attempt)
 
@@ -85,8 +105,9 @@ def dispatch_task(
         dispatch_profile=dispatch_profile or task.get("dispatch_profile", ""),
         runtime_type=task.get("task_type", "ship"),
     )
+    if metrics:
+        metrics.inc("conductor_agent_runs_total")
 
-    # Create task in Agents Gateway
     # Update task status: created -> ready -> dispatched -> running
     # Transition through ready first if needed
     if task["status"] == "created":
@@ -95,6 +116,14 @@ def dispatch_task(
     if task["status"] == "ready":
         storage.update_task_status(task_id, "dispatched")
         task = storage.get_task(task_id)
+
+    # Emit agent_run.created now that the row exists and was linked to its task.
+    emit(
+        storage, "agent_run.created",
+        f"Agent run {agent_run['id']} created for task {task_id}",
+        objective_id=task["objective_id"], run_id=task["run_id"],
+        task_id=task_id, agent_run_id=agent_run["id"], source="conductor",
+    )
 
     try:
         gw_task = gateway.create_task(
@@ -110,6 +139,15 @@ def dispatch_task(
             conn.commit()
         agent_run = storage.get_agent_run(agent_run["id"])
 
+        # Emit task.dispatched now that the gateway task is real.
+        emit(
+            storage, "task.dispatched",
+            f"Task {task_id} dispatched to gateway task {gw_task.id}",
+            objective_id=task["objective_id"], run_id=task["run_id"],
+            task_id=task_id, agent_run_id=agent_run["id"], source="conductor",
+            payload={"agents_gateway_task_id": gw_task.id},
+        )
+
         # Now run the task
         try:
             gw_task = gateway.run_task(gw_task.id)
@@ -120,6 +158,10 @@ def dispatch_task(
         except Exception as e:
             logger.warning("run_task_failed task_id=%s error=%s", task_id, e)
             agent_run = storage.update_agent_run_status(agent_run["id"], "failed")
+            emit(storage, "agent_run.failed", f"Agent run failed: {e}",
+                 objective_id=task["objective_id"], run_id=task["run_id"],
+                 task_id=task_id, agent_run_id=agent_run["id"],
+                 source="conductor")
             emit(storage, "dispatch.run_failed", f"Failed to run task: {e}",
                  objective_id=task["objective_id"], run_id=task["run_id"],
                  task_id=task_id, agent_run_id=agent_run["id"],
@@ -128,10 +170,16 @@ def dispatch_task(
     except Exception as e:
         logger.error("dispatch_failed task_id=%s error=%s", task_id, e)
         storage.update_agent_run_status(agent_run["id"], "failed")
+        emit(storage, "agent_run.failed", f"Agent run failed: {e}",
+             objective_id=task["objective_id"], run_id=task["run_id"],
+             task_id=task_id, agent_run_id=agent_run["id"],
+             source="conductor")
         emit(storage, "dispatch.failed", f"Dispatch failed: {e}",
              objective_id=task["objective_id"], run_id=task["run_id"],
              task_id=task_id, agent_run_id=agent_run["id"],
              source="conductor")
+        if metrics:
+            metrics.inc("conductor_dispatch_errors_total")
         raise DispatchError(f"Failed to dispatch task: {e}")
 
     emit(storage, "dispatch.completed", f"Dispatched task {task_id} attempt {attempt}",
@@ -146,6 +194,7 @@ def reconcile_task(
     storage: ConductorStorage,
     gateway: BaseAgentsGatewayClient,
     agent_run_id: str,
+    metrics=None,
 ) -> dict | None:
     agent_run = storage.get_agent_run(agent_run_id)
     if not agent_run:
@@ -192,6 +241,24 @@ def reconcile_task(
                     )
                     conn.commit()
 
+            # Fan out: emit both the detailed `agent_run.<state>` lifecycle
+            # event (consumed by the audit/metrics pipeline) and the
+            # `reconciliation.status_update` event (consumed by operators).
+            emit(storage, f"agent_run.{target}",
+                 f"Agent run {agent_run_id} → {target}",
+                 objective_id=agent_run.get("objective_id"), run_id=agent_run.get("run_id"),
+                 task_id=agent_run["task_id"], agent_run_id=agent_run_id,
+                 source="conductor",
+                 payload={"from": agent_run["status"], "to": target})
+            if target in {"completed", "failed", "cancelled"}:
+                # Spec names: agent_run.completed/failed both already covered above.
+                pass
+            emit(storage, "agent_run.reconciled",
+                 f"Reconciled {agent_run_id} ({agent_run['status']} → {target})",
+                 objective_id=agent_run.get("objective_id"), run_id=agent_run.get("run_id"),
+                 task_id=agent_run["task_id"], agent_run_id=agent_run_id,
+                 source="conductor",
+                 payload={"from": agent_run["status"], "to": target})
             emit(storage, "reconciliation.status_update",
                  f"Reconciled {agent_run_id} from {agent_run['status']} to {target}",
                  objective_id=agent_run.get("objective_id"), run_id=agent_run.get("run_id"),
@@ -217,6 +284,15 @@ def reconcile_task(
             merged = list(existing_refs) + new_refs
             if new_refs:
                 storage.set_agent_run_artifacts(agent_run_id, merged)
+                if metrics:
+                    metrics.inc("conductor_artifacts_ingested_total", amount=float(len(new_refs)))
+                emit(storage, "artifacts.ingested",
+                     f"Ingested {len(new_refs)} artifact(s) for {agent_run_id}",
+                     objective_id=agent_run.get("objective_id"), run_id=agent_run.get("run_id"),
+                     task_id=agent_run["task_id"], agent_run_id=agent_run_id,
+                     source="conductor",
+                     payload={"count": len(new_refs),
+                              "names": [r.get("name") for r in new_refs]})
                 emit(storage, "reconciliation.artifacts_ingested",
                      f"Ingested {len(new_refs)} artifact(s) for {agent_run_id}",
                      objective_id=agent_run.get("objective_id"), run_id=agent_run.get("run_id"),
@@ -229,6 +305,13 @@ def reconcile_task(
     except Exception as e:
         logger.warning("reconcile_error agent_run_id=%s error=%s", agent_run_id, e)
         storage.update_agent_run_status(agent_run_id, "lost")
+        if metrics:
+            metrics.inc("conductor_reconciliation_errors_total")
+        emit(storage, "agent_run.failed",
+             f"Reconcile failed for {agent_run_id}: {e}",
+             objective_id=agent_run.get("objective_id"), run_id=agent_run.get("run_id"),
+             task_id=agent_run["task_id"], agent_run_id=agent_run_id,
+             source="conductor")
         return storage.get_agent_run(agent_run_id)
 
 
@@ -236,6 +319,7 @@ def reconcile_all(
     storage: ConductorStorage,
     gateway: BaseAgentsGatewayClient,
     statuses: tuple[str, ...] | None = None,
+    metrics=None,
 ) -> dict:
     """Reconcile all in-flight agent_runs against the gateway. Called after restart.
 
@@ -252,7 +336,7 @@ def reconcile_all(
         ar_id = ar["id"]
         before_status = ar["status"]
         try:
-            after = reconcile_task(storage, gateway, ar_id)
+            after = reconcile_task(storage, gateway, ar_id, metrics=metrics)
             reconciled += 1
             if after and after.get("status") != before_status:
                 transitions += 1
@@ -260,6 +344,8 @@ def reconcile_all(
         except Exception as e:
             logger.warning("reconcile_all_error agent_run_id=%s error=%s", ar_id, e)
             errors += 1
+            if metrics:
+                metrics.inc("conductor_reconciliation_errors_total")
 
     summary = {
         "reconciled": reconciled,
