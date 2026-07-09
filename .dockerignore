@@ -9,5 +9,4 @@ data/
 *.db
 tests/
 docs/
-README.md
 SECURITY.md

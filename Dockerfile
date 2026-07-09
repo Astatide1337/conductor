@@ -2,10 +2,11 @@ FROM python:3.12-slim
 
 RUN pip install --no-cache-dir uv
 
-RUN groupadd -r appgroup && useradd -r -g appgroup -s /bin/bash appuser
+RUN groupadd -r -g 1000 appgroup && useradd -r -u 1000 -g appgroup -s /bin/bash appuser
 
 WORKDIR /app
 
+COPY README.md ./
 COPY pyproject.toml ./
 COPY conductor/ ./conductor/
 COPY server.py ./
