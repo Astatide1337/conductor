@@ -11,6 +11,7 @@ Persistent objective/task-graph orchestrator for MCP-driven agent workflows.
 - An approval and policy enforcement layer
 - A dispatch coordinator to Agents Gateway
 - A high-level MCP cockpit surface
+- **Composer v1** — spec-to-verified-execution engine (planning, parallel dispatch, interaction answering, integration, verification, HTML/JSON reports)
 
 ## What Conductor is NOT
 
@@ -28,6 +29,8 @@ Any MCP-compatible cockpit (Claude / ChatGPT / Polychat / CLI / future UI)
        v
    CONDUCTOR  ─── single hub (REST + MCP)
        |
+       +--> Composer (spec-to-verified-execution engine)
+       |
    +---+---+---+---+---------+
    |   |   |   |   |         |
    v   v   v   v   v         v
@@ -38,6 +41,8 @@ Gateway Gateway Gateway mcp  (mail / calendar / cloud / deploy)
 Conductor is the single hub. Gateways are downstream capability providers
 — the MCP Gateway is one of them, not the parent of Conductor. See
 [`docs/gateway-hub.md`](docs/gateway-hub.md) for the full Gateway Hub
+architecture and [`docs/composer.md`](docs/composer.md) for the Composer
+spec-to-verified-execution engine.
 reference.
 
 ## Auth model

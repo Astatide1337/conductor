@@ -92,6 +92,23 @@ class PlannerConfig(BaseModel):
     llm_max_tokens: int = 4096
 
 
+class ComposerConfig(BaseModel):
+    enabled: bool = True
+    llm_base_url: str = "https://openrouter.ai/api/v1"
+    llm_api_key: str = ""
+    llm_model: str = ""
+    llm_timeout_seconds: float = 180.0
+    max_parallel_tasks: int = 3
+    poll_interval_seconds: float = 10.0
+    default_harness_profile: str = "opencode-deepseek"
+    integration_harness_profile: str = "opencode-deepseek"
+    auto_start: bool = True
+    auto_commit: bool = True
+    auto_push: bool = False
+    auto_pr: bool = False
+    report_dir: str = "/var/lib/conductor/composer-reports"
+
+
 class ConductorConfig(BaseModel):
     service: ServiceConfig = field(default_factory=ServiceConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
@@ -103,6 +120,7 @@ class ConductorConfig(BaseModel):
     wiki_mcp: WikiMcpClientConfig = field(default_factory=WikiMcpClientConfig)
     circuit: CircuitConfig = field(default_factory=CircuitConfig)
     planner: PlannerConfig = field(default_factory=PlannerConfig)
+    composer: ComposerConfig = field(default_factory=ComposerConfig)
     environment: str = "dev"
 
 
