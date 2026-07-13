@@ -45,20 +45,29 @@ from conductor.gateways.registry import GatewayRegistry, GatewayConfig
 
 
 def _build_gateway_client(cfg: ConductorConfig) -> BaseAgentsGatewayClient:
-    """Build the Agents Gateway client. Real HTTP when CONDUCTOR_AGENTS_GATEWAY_URL
-    is set to a non-localhost URL, otherwise a Mock client for offline dev/test.
-    Provides a shared configured agents gateway actor to the HTTP routes + MCP tools,
-    so dispatch and reconcile use the same gateway instance."""
+    """Build the Agents Gateway client.
+
+    Outside explicit test mode:
+    - a configured real URL uses the HTTP client
+    - localhost URLs only use Mock in dev/test environment
+    - missing URL with composer enabled and not test_mode → error
+    """
     gw_cfg = cfg.agents_gateway
-    if gw_cfg.url and gw_cfg.auth_mode != "dev-none" and not _is_localhost_url(gw_cfg.url):
+    is_test = cfg.composer.test_mode or cfg.environment in ("test", "dev")
+    if gw_cfg.url and not _is_localhost_url(gw_cfg.url):
         return HttpAgentsGatewayClient(gw_cfg)
-    # Mock for offline / dev
-    mock = MockAgentsGatewayClient()
-    mock.register_agent("code-validator", "Code Validator")
-    mock.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
-    mock.register_harness_profile("pi-coding-agent", "Pi Coding Agent", runnable=True)
-    mock.register_harness_profile("claude-code", "Claude Code", runnable=True)
-    return mock
+    if gw_cfg.url and _is_localhost_url(gw_cfg.url) and not is_test:
+        return HttpAgentsGatewayClient(gw_cfg)
+    if is_test:
+        mock = MockAgentsGatewayClient()
+        mock.register_agent("code-validator", "Code Validator")
+        mock.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        mock.register_harness_profile("pi-coding-agent", "Pi Coding Agent", runnable=True)
+        mock.register_harness_profile("claude-code", "Claude Code", runnable=True)
+        return mock
+    # No URL at all and not test mode — return HttpAgentsGatewayClient with
+    # the default localhost URL, which will produce clear connection errors.
+    return HttpAgentsGatewayClient(gw_cfg)
 
 
 def _build_skills_client(cfg: ConductorConfig) -> BaseSkillsGatewayClient | None:
@@ -181,6 +190,7 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         composer_storage = ComposerStorage(cfg.storage.sqlite_path)
         composer_storage.initialize()
 
+        is_test_mode = cfg.composer.test_mode or cfg.environment in ("test", "dev")
         if cfg.composer.llm_api_key and cfg.composer.llm_model:
             llm_client = HttpComposerLLMClient(
                 base_url=cfg.composer.llm_base_url,
@@ -188,8 +198,13 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
                 model=cfg.composer.llm_model,
                 timeout=cfg.composer.llm_timeout_seconds,
             )
-        else:
+        elif is_test_mode:
             llm_client = FakeComposerLLMClient()
+        else:
+            raise RuntimeError(
+                "Composer LLM key/model not configured. Set CONDUCTOR_COMPOSER__LLM_API_KEY "
+                "and CONDUCTOR_COMPOSER__LLM_MODEL, or enable test_mode."
+            )
 
         app_state_composer = ComposerService(
             storage=composer_storage,
@@ -199,6 +214,7 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
             config=cfg.composer,
             skills_gateway_client=skills_client,
             wiki_mcp_client=None,
+            mcp_gateway_client=mcp_gw_client,
             gateway_registry=gw_registry,
             metrics=metrics_reg,
         )

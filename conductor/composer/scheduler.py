@@ -126,7 +126,28 @@ class Scheduler:
                       objective_id=objective_id,
                       payload={"node_id": node.node_id, "plan_id": plan_id})
 
-        brief_text = node.goal
+        # Build full task brief with dependency branches/commits/verification
+        from conductor.composer.models import NormalizedSpec
+        ns_dict = spec.get("normalized_spec", {})
+        ns = NormalizedSpec(**ns_dict) if isinstance(ns_dict, dict) else NormalizedSpec()
+
+        completed_deps: list[TaskNode] = []
+        for dep_id in node.dependencies:
+            dep_pt = self.storage.get_plan_task_by_node(plan_id, dep_id)
+            if dep_pt and dep_pt.get("status") == "completed":
+                completed_deps.append(TaskNode(
+                    node_id=dep_id,
+                    title=dep_pt.get("task_type", dep_id),
+                    branch=dep_pt.get("branch"),
+                    commit_sha=dep_pt.get("commit_sha"),
+                ))
+
+        brief_text = build_task_brief(
+            node=node,
+            spec=ns,
+            completed_deps=completed_deps,
+            overall_summary=spec.get("raw_spec", "")[:500],
+        )
 
         idem_key = build_idempotency_key(objective_id, plan_id, node.node_id, attempt)
 
@@ -150,7 +171,7 @@ class Scheduler:
                 "text": brief_text,
             },
             "required_skills": node.required_skills,
-            "required_tools": [],
+            "required_tools": node.required_capabilities,
             "verification": node.verification.model_dump(),
             "artifacts": {
                 "html_report": True,
@@ -162,6 +183,10 @@ class Scheduler:
                 "composer_objective_id": objective_id,
                 "composer_plan_id": plan_id,
                 "composer_node_id": node.node_id,
+                "dependency_branches": [
+                    {"node_id": d.node_id, "branch": d.branch or "", "commit_sha": d.commit_sha or ""}
+                    for d in completed_deps
+                ],
             },
         }
 

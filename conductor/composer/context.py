@@ -44,6 +44,7 @@ def build_composer_context(
     agents_gateway_client=None,
     skills_gateway_client=None,
     wiki_mcp_client=None,
+    mcp_gateway_client=None,
 ) -> ComposerContext:
     """Build composer context for planning.
 
@@ -133,10 +134,17 @@ def build_composer_context(
         except Exception as exc:
             logger.warning("Failed to read wiki context: %s", exc)
 
-    # Project context from local repo
+    # Project context from local repo or MCP gateway
     project_context: dict = {}
+    repo_url = (spec or {}).get("normalized_spec", {}).get("repository", {}).get("url", "") if spec else ""
     if repo_path and os.path.isdir(repo_path):
         project_context = _build_project_context(repo_path)
+    elif repo_url and mcp_gateway_client:
+        try:
+            project_context = _build_remote_context(mcp_gateway_client, repo_url)
+        except Exception as exc:
+            logger.warning("Failed to fetch remote repo context: %s", exc)
+            project_context["repo_url"] = repo_url
     elif spec and spec.get("normalized_spec", {}).get("repository", {}).get("url"):
         project_context["repo_url"] = spec["normalized_spec"]["repository"]["url"]
 
@@ -192,6 +200,31 @@ def _build_project_context(repo_path: str) -> dict:
             tree_summary.append(item.name)
     ctx["tree_summary"] = tree_summary
 
+    return ctx
+
+
+def _build_remote_context(mcp_client, repo_url: str) -> dict:
+    """Fetch bounded repo context via MCP Gateway/GitHub capability."""
+    ctx: dict[str, any] = {"repo_url": repo_url}
+    files_to_fetch = ["README.md", "AGENTS.md", "CLAUDE.md", "docs/architecture.md", "ARCHITECTURE.md"]
+    for filename in files_to_fetch:
+        try:
+            content = mcp_client.read_file(repo_url, filename)
+            if content:
+                if "README" in filename:
+                    ctx["readme"] = content[:4000]
+                elif filename in ("AGENTS.md", "CLAUDE.md"):
+                    ctx["agent_instructions"] = ctx.get("agent_instructions", "") + "\n" + content[:2000]
+                elif "architecture" in filename.lower():
+                    ctx["architecture_summary"] = content[:4000]
+        except Exception:
+            pass
+    try:
+        tree = mcp_client.list_files(repo_url, depth=2)
+        if tree:
+            ctx["tree_summary"] = tree[:200] if isinstance(tree, list) else str(tree)[:500]
+    except Exception:
+        pass
     return ctx
 
 

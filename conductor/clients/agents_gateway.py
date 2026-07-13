@@ -16,6 +16,7 @@ Production HTTP client includes:
 
 import random
 import time
+import json
 from dataclasses import dataclass, field
 from typing import Optional
 from unittest.mock import MagicMock
@@ -264,6 +265,12 @@ class BaseAgentsGatewayClient:
         raise NotImplementedError
 
     def get_task_worktree(self, task_id: str) -> WorktreeInfo | None:
+        raise NotImplementedError
+
+    def download_artifact(self, task_id: str, artifact_name: str) -> bytes | None:
+        raise NotImplementedError
+
+    def get_task_result(self, task_id: str) -> dict | None:
         raise NotImplementedError
 
     def close(self) -> None:
@@ -535,6 +542,16 @@ class MockAgentsGatewayClient(BaseAgentsGatewayClient):
     def add_artifact(self, task_id: str, name: str, path: str = "", size: int = 0) -> None:
         art = TaskArtifact(id=f"art-{len(self._artifacts.get(task_id, []))}", task_id=task_id, name=name, path=path, size_bytes=size, created_at="now")
         self._artifacts.setdefault(task_id, []).append(art)
+
+    def download_artifact(self, task_id: str, artifact_name: str) -> bytes | None:
+        arts = self._artifacts.get(task_id, [])
+        for a in arts:
+            if a.name == artifact_name:
+                return json.dumps({"git": {"commit_sha": self._worktrees.get(f"wt-{task_id}", WorktreeInfo()).commit_sha or f"mock-sha-{task_id}"}, "status": "completed"}).encode()
+        return None
+
+    def get_task_result(self, task_id: str) -> dict | None:
+        return {"status": "completed", "output": self._tasks.get(task_id, TaskInfo(id=task_id, agent_id="")).output}
 
 
 class HttpAgentsGatewayClient(BaseAgentsGatewayClient):
@@ -914,6 +931,7 @@ class HttpAgentsGatewayClient(BaseAgentsGatewayClient):
             agent_run_id=data.get("agent_run_id", ""),
             branch=data.get("branch", ""),
             base_branch=data.get("base_branch", ""),
+            commit_sha=data.get("commit_sha", ""),
             path=data.get("path", ""),
             status=data.get("status", ""),
             created_at=data.get("created_at", ""),

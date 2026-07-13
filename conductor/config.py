@@ -99,6 +99,7 @@ class ComposerConfig(BaseModel):
     llm_model: str = ""
     llm_timeout_seconds: float = 180.0
     max_parallel_tasks: int = 3
+    max_repair_retries: int = 3
     poll_interval_seconds: float = 10.0
     default_harness_profile: str = "opencode-deepseek"
     integration_harness_profile: str = "opencode-deepseek"
@@ -107,6 +108,7 @@ class ComposerConfig(BaseModel):
     auto_push: bool = False
     auto_pr: bool = False
     report_dir: str = "/var/lib/conductor/composer-reports"
+    test_mode: bool = False  # when True, allows FakeComposerLLMClient and MockAgentsGatewayClient
 
 
 class ConductorConfig(BaseModel):

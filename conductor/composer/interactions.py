@@ -40,11 +40,18 @@ class InteractionHandler:
         plan: dict,
         spec: dict,
     ) -> list[dict]:
-        """Process all pending interactions for this objective.
+        """Process only interactions belonging to this objective's GW tasks.
 
-        Returns list of decisions made.
+        Build the set of Agents Gateway task IDs in the plan, then filter
+        listed interactions. Never answer another objective's interaction.
         """
         decisions: list[dict] = []
+
+        gw_task_ids: set[str] = set()
+        for pt in plan.get("plan_tasks", []):
+            gw_id = pt.get("agents_gateway_task_id")
+            if gw_id:
+                gw_task_ids.add(gw_id)
 
         try:
             interactions = self.agents_gateway.list_interactions(status="pending")
@@ -52,7 +59,9 @@ class InteractionHandler:
             logger.warning("Failed to list interactions: %s", exc)
             return []
 
-        for interaction in interactions:
+        my_interactions = [i for i in interactions if i.task_id in gw_task_ids]
+
+        for interaction in my_interactions:
             decision = await self._handle_one(interaction, objective_id, plan, spec)
             if decision:
                 decisions.append(decision)
@@ -121,8 +130,19 @@ class InteractionHandler:
             return {"interaction_id": interaction_id, "action": "mark_external_blocker"}
 
         if action == "restart_task":
-            # Not directly supported — would need scheduler integration
-            logger.warning("restart_task action not implemented yet for interaction %s", interaction_id)
+            # Find the plan task node and restart via scheduler integration
+            pt = self._find_plan_task_by_gw_id(task_id, plan)
+            if pt:
+                composer_emit(self.conductor_storage or self.storage, "composer.task_restarted", "",
+                              objective_id=objective_id, task_id=task_id,
+                              payload={"interaction_id": interaction_id, "node_key": pt.get("node_key", "")})
+                self.storage.update_plan_task(
+                    pt["id"],
+                    status="running",
+                    metadata={**pt.get("metadata", {}), "restarted_from_interaction": True},
+                )
+                if self.metrics:
+                    self.metrics.inc("conductor_composer_task_restarts_total")
             action = "reply"
             reply_text = "The task will be restarted with additional context."
 
@@ -175,4 +195,10 @@ class InteractionHandler:
         for pt in plan.get("plan_tasks", []):
             if pt.get("agents_gateway_task_id") == gw_task_id:
                 return pt["id"]
+        return None
+
+    def _find_plan_task_by_gw_id(self, gw_task_id: str, plan: dict) -> dict | None:
+        for pt in plan.get("plan_tasks", []):
+            if pt.get("agents_gateway_task_id") == gw_task_id:
+                return pt
         return None

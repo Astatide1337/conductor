@@ -71,19 +71,31 @@ class ComposerSupervisor:
         logger.info("composer_supervisor_stopped")
 
     async def _tick(self) -> None:
-        """Reconcile all active Composer objectives on each tick."""
+        """Reconcile all active Composer objectives on each tick.
+
+        After a Conductor restart, persisted transitional states must advance
+        idempotently.  start_objective handles received/normalized/planning/planned;
+        reconcile_objective handles executing/integrating/verifying.
+
+        Objectives with composer_auto_start=False remain pending until
+        explicitly started via POST /composer/objectives/{id}/start.
+        """
         active_objectives = self.service.list_objectives(limit=100)
         for obj in active_objectives:
             composer_status = obj.get("composer_status", "")
             if composer_status in ("received", "normalizing", "normalized", "planning", "planned",
                                    "executing", "integrating", "verifying"):
+
+                # auto_start=false objects must remain at 'received' until explicit start
+                meta = obj.get("metadata", {}) or {}
+                if composer_status == "received" and not meta.get("composer_auto_start", True):
+                    continue
+
                 try:
-                    if composer_status in ("received", "normalized", "planning", "planned"):
-                        # Start/advance the pipeline for new objectives
+                    if composer_status in ("received", "normalizing", "normalized", "planning", "planned"):
                         await self.service.start_objective(obj["id"])
                     if composer_status in ("executing", "integrating", "verifying"):
                         await self.service.reconcile_objective(obj["id"])
-                    # Also reconcile planned objectives to pick up task statuses
                     if composer_status == "planned":
                         await self.service.reconcile_objective(obj["id"])
                 except Exception as exc:

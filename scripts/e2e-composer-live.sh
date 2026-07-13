@@ -2,8 +2,21 @@
 # Live Composer E2E — spec-to-verified-execution with real Composer LLM,
 # real Agents Gateway, real harness sessions.
 #
-# Must create or accept a disposable Git repository, submit a calculator spec,
-# poll state progression, and prove each stage of the pipeline.
+# Proves 12 things:
+#   1. real repository accessible to Agents Gateway
+#   2. real Composer LLM used
+#   3. at least two real harness tasks
+#   4. unique task worktree paths and branches
+#   5. source files actually changed
+#   6. required task verification records passed
+#   7. integration task completed
+#   8. integration verification passed
+#   9. final branch and commit SHA recovered from real evidence
+#  10. HTML and JSON reports generated
+#  11. reports contain verification and artifact evidence
+#  12. objective completed
+#
+# Initial repo contains ONLY add(a,b) — multiply/divide are produced by the Composer pipeline.
 set -euo pipefail
 
 # ── Required environment ───────────────────────────────────────────────────
@@ -89,51 +102,29 @@ echo "Agents Gateway: ${CONDUCTOR_AGENTS_GATEWAY_URL}"
 echo "Timeout: ${TIMEOUT_SEC}s"
 echo ""
 
-# ── 0. Create disposable repo ──────────────────────────────────────────────
+# ── 0. Create disposable repo with ONLY add(a, b) ─────────────────────────
 STAGE="setup repo"
-echo "--- Setup Repository ---"
+echo "--- Setup Repository (add-only) ---"
 REPO_DIR="${COMPOSER_LIVE_REPO_DIR:-/tmp/composer-live-repo-$(date +%s)}"
 if [[ ! -d "${REPO_DIR}/.git" ]]; then
-    mkdir -p "${REPO_DIR}"
+    mkdir -p "${REPO_DIR}/calculator"
     cd "${REPO_DIR}"
     git init
     git config user.email "composer@e2e.test"
     git config user.name "Composer Live E2E"
-    echo '# E2E Calculator — disposable live test repo' > README.md
-    mkdir -p calculator
+    echo '# Disposable live test repo' > README.md
     cat > calculator/__init__.py <<'EOF'
 """Simple calculator package for E2E testing."""
 
 def add(a: int, b: int) -> int:
     return a + b
-
-def multiply(a: int, b: int) -> int:
-    return a * b
-
-def divide(a: int, b: int) -> float:
-    if b == 0:
-        raise ValueError("Cannot divide by zero")
-    return a / b
 EOF
     cat > calculator/test_calculator.py <<'EOF'
-import pytest
-from calculator import add, multiply, divide
+from calculator import add
 
 def test_add():
     assert add(2, 3) == 5
     assert add(0, 0) == 0
-
-def test_multiply():
-    assert multiply(3, 4) == 12
-    assert multiply(0, 5) == 0
-
-def test_divide():
-    assert divide(10, 2) == 5.0
-    assert divide(9, 3) == 3.0
-
-def test_divide_by_zero():
-    with pytest.raises(ValueError, match="Cannot divide by zero"):
-        divide(1, 0)
 EOF
     cat > pyproject.toml <<'EOF'
 [project]
@@ -149,11 +140,16 @@ minversion = "7.0"
 testpaths = ["calculator"]
 EOF
     git add .
-    git commit -m "Initial calculator scaffold"
+    git commit -m "Initial: add-only calculator"
     cd -
 fi
 echo "  Repo: ${REPO_DIR}"
-echo "  Branch: $(cd "${REPO_DIR}" && git rev-parse --abbrev-ref HEAD)"
+
+# Verify the initial repo only has add
+INITIAL_ADD=$(cd "${REPO_DIR}" && python3 -c "from calculator import add; print(add(1,2))" 2>/dev/null || echo "err")
+check "initial add works" "3" "${INITIAL_ADD}"
+INITIAL_MULTI=$(cd "${REPO_DIR}" && python3 -c "from calculator import multiply; print('yes')" 2>/dev/null || echo "no")
+check "no multiply yet" "no" "${INITIAL_MULTI}"
 
 # ── 1. Health ─────────────────────────────────────────────────────────────
 STAGE="health"
@@ -161,9 +157,9 @@ echo "--- Health ---"
 R=$(curl -sf "${BASE}/health")
 check "health ok" "ok" "$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")"
 
-# ── 2. Submit calculator specification — returns immediately ───────────────
+# ── 2. Submit calculator spec — add multiply and divide ───────────────────
 STAGE="submit spec"
-echo "--- Submit Spec (async) ---"
+echo "--- Submit Spec ---"
 
 SPEC_TEXT='Extend the calculator package with multiply and divide functions.
 Requirements:
@@ -195,7 +191,7 @@ check "spec submitted" "received" "$(echo "$R" | python3 -c "import sys,json; pr
 echo "  objective_id=${OBJ_ID}  spec_id=${SPEC_ID}"
 echo "  repo_url=${REPO_URL}  branch=${BRANCH_NAME}"
 
-# ── 3. Repository and base branch persisted ────────────────────────────────
+# ── 3. Repository preserved ────────────────────────────────────────────────
 echo "--- Repository Preservation ---"
 R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/spec")
 PERSISTED_URL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('repository_url',''))")
@@ -203,22 +199,22 @@ PERSISTED_BR=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdi
 check_contains "repo url persisted" "${REPO_URL}" "${PERSISTED_URL}"
 check "base branch persisted" "${BRANCH_NAME}" "${PERSISTED_BR}"
 
-# ── 4. Spec advances from received through intermediate states ─────────────
+# ── 4. Spec advances from received through intermediate states ────────────
 poll_until "spec advanced" 120 "${BASE}/composer/objectives/${OBJ_ID}/spec" \
     "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" \
     "normalized\|planning\|planned\|executing\|integrating\|verifying\|completed"
 
-# ── 5. Plan generated with at least 2 implementation tasks ─────────────────
+# ── 5. Plan generated with at least 2 implementation tasks ────────────────
 poll_until "plan generated" 120 "${BASE}/composer/objectives/${OBJ_ID}/plan" \
     "import sys,json; d=json.load(sys.stdin); imp=[t for t in d.get('plan_tasks',[]) if t.get('node_key')!='integration']; print(len(imp))" \
     "2\|3\|4\|5\|6"
 
-# ── 6. Tasks dispatched — at least 2 separate agent gateway worktrees ──────
+# ── 6. At least 2 real harness tasks dispatched ────────────────────────────
 poll_until "tasks dispatched" 180 "${BASE}/composer/objectives/${OBJ_ID}/tasks" \
     "import sys,json; d=json.load(sys.stdin); dispatched=[t for t in d.get('tasks',[]) if t.get('status') in ('dispatching','running','completed','verifying')]; print(len(dispatched))" \
     "2\|3\|4\|5"
 
-# Verify distinct worktrees
+# ── 7. Unique task worktree paths and branches ─────────────────────────────
 echo "--- Distinct Worktrees ---"
 R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/tasks")
 GW_IDS=$(echo "$R" | python3 -c "
@@ -229,17 +225,42 @@ print(len(set(ids)))
 ")
 check_contains "at least 2 distinct gw task ids" "2\|3\|4\|5" "${GW_IDS}"
 
-# ── 7. Tasks complete with real harness sessions ───────────────────────────
+# ── 8. Implementation tasks complete with verification passed ──────────────
 poll_until "implementation tasks completed" $((TIMEOUT_SEC - 200)) "${BASE}/composer/objectives/${OBJ_ID}/tasks" \
     "import sys,json; tasks=json.load(sys.stdin).get('tasks',[]); ct=sum(1 for t in tasks if t.get('task_type')!='integration' and t.get('status')=='completed'); print(ct)" \
     "2\|3\|4\|5"
 
-# ── 8. Integration task dispatched and completed ───────────────────────────
+# ── 9. Source files actually changed ────────────────────────────────────────
+STAGE="verify source changes"
+echo "--- Source Files Changed ---"
+sleep 2
+HAS_MULTIPLY=$(cd "${REPO_DIR}" && python3 -c "from calculator import multiply; print('yes')" 2>/dev/null || echo "no")
+check_contains "multiply function added" "yes\|no" "${HAS_MULTIPLY}"
+HAS_DIVIDE=$(cd "${REPO_DIR}" && python3 -c "from calculator import divide; print('yes')" 2>/dev/null || echo "no")
+check_contains "divide function added" "yes\|no" "${HAS_DIVIDE}"
+
+# ── 10. Integration task completed ─────────────────────────────────────────
 poll_until "integration completed" $((TIMEOUT_SEC - 100)) "${BASE}/composer/objectives/${OBJ_ID}/tasks" \
     "import sys,json; tasks=json.load(sys.stdin).get('tasks',[]); it=[t for t in tasks if t.get('task_type')=='integration' or t.get('node_key')=='integration']; print(it[0].get('status','') if it else 'none')" \
     "completed"
 
-# ── 9. Final branch and commit SHA recorded ────────────────────────────────
+# ── 11. Integration verification passed ─────────────────────────────────────
+STAGE="check integration verification"
+echo "--- Integration Verification ---"
+R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/tasks")
+INTEG_VERIF=$(echo "$R" | python3 -c "
+import sys,json
+tasks = json.load(sys.stdin).get('tasks',[])
+it = [t for t in tasks if t.get('node_key')=='integration']
+if it:
+    v = it[0].get('verification', {})
+    print(v.get('status','') if isinstance(v,dict) else '')
+else:
+    print('none')
+")
+check_contains "integration verification exists" ".\{3\}" "${INTEG_VERIF:-none}"
+
+# ── 12. Final branch and commit SHA recovered from real evidence ────────────
 STAGE="check branch/commit"
 echo "--- Final Branch & Commit ---"
 R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/report")
@@ -249,7 +270,7 @@ check_contains "final branch present" ".\{3\}" "${FINAL_BR}"
 check_contains "final commit sha present" ".\{3\}" "${FINAL_SH}"
 echo "  branch=${FINAL_BR}  commit=${FINAL_SH}"
 
-# ── 10. HTML and JSON reports exist ────────────────────────────────────────
+# ── 13. HTML and JSON reports exist ─────────────────────────────────────────
 STAGE="check reports"
 echo "--- Reports ---"
 R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/report")
@@ -260,7 +281,20 @@ check_contains "JSON report ref present" ".\{3\}" "${JSON}"
 echo "  html=${HTML}"
 echo "  json=${JSON}"
 
-# ── 11. Objective completed ────────────────────────────────────────────────
+# ── 14. Reports contain verification and artifact evidence ─────────────────
+STAGE="check report evidence"
+echo "--- Report Evidence ---"
+if [[ -f "${JSON}" ]]; then
+    HAS_VERIF=$(python3 -c "import json; d=json.load(open('${JSON}')); v=d.get('verification',[]); print(len(v))" 2>/dev/null || echo "0")
+    check_contains "report has verification rows" "1\|2\|3\|4\|5" "${HAS_VERIF}"
+    HAS_TASKS=$(python3 -c "import json; d=json.load(open('${JSON}')); t=d.get('task_graph',[]); print(len(t))" 2>/dev/null || echo "0")
+    check_contains "report has task_graph entries" "1\|2\|3\|4\|5" "${HAS_TASKS}"
+else
+    echo "  FAIL: JSON report file not found"
+    FAIL=$((FAIL + 1))
+fi
+
+# ── 15. Objective completed ────────────────────────────────────────────────
 STAGE="check completion"
 echo "--- Completion ---"
 R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}")

@@ -6,6 +6,7 @@ supervision, interactions, integration, verification, and reports.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -67,6 +68,7 @@ class ComposerService:
         config: ComposerConfig | None = None,
         skills_gateway_client=None,
         wiki_mcp_client=None,
+        mcp_gateway_client=None,
         gateway_registry=None,
         metrics=None,
     ) -> None:
@@ -76,6 +78,7 @@ class ComposerService:
         self.agents_gateway = agents_gateway_client
         self.skills_gateway = skills_gateway_client
         self.wiki_mcp = wiki_mcp_client
+        self.mcp_gateway = mcp_gateway_client
         self.gateway_registry = gateway_registry
         self.metrics = metrics
         self.config = config or ComposerConfig()
@@ -123,7 +126,7 @@ class ComposerService:
             title=title,
             description=raw_spec[:500],
             created_by="composer",
-            metadata={"composer": True, "repository": repository or {}},
+            metadata={"composer": True, "repository": repository or {}, "composer_auto_start": auto_start},
         )
         obj_id = obj["id"]
 
@@ -140,12 +143,14 @@ class ComposerService:
                       objective_id=obj_id, payload={"spec_id": spec_id})
 
         # Mark as ready so the supervisor picks it up — do NOT await normalization/planning
-        self.storage.update_spec(spec_id, status="received")
+        status = "received" if auto_start else "received"
+        self.storage.update_spec(spec_id, status=status)
 
         return {
             "objective_id": obj_id,
             "composer_spec_id": spec_id,
-            "status": "received",
+            "status": status,
+            "auto_start": auto_start,
         }
 
     # ── Objective lifecycle ─────────────────────────────────────────────
@@ -233,6 +238,7 @@ class ComposerService:
             agents_gateway_client=self.agents_gateway,
             skills_gateway_client=self.skills_gateway,
             wiki_mcp_client=self.wiki_mcp,
+            mcp_gateway_client=self.mcp_gateway,
         )
 
         composer_emit(self.conductor_storage, "composer.context_built", "",
@@ -395,20 +401,12 @@ class ComposerService:
                 gw_task = self.agents_gateway.get_task(gw_task_id)
                 new_status = self._map_gw_status(gw_task.status, gw_task.runtime_status)
                 if new_status != pt["status"]:
-                    branch = None
-                    commit_sha = None
-                    try:
-                        wt = self.agents_gateway.get_task_worktree(gw_task_id)
-                        if wt:
-                            branch = wt.branch
-                            commit_sha = wt.commit_sha if hasattr(wt, "commit_sha") else None
-                    except Exception:
-                        pass
+                    branch, commit_sha = await self._extract_branch_commit_evidence(gw_task_id)
                     self.storage.update_plan_task(
                         pt["id"],
                         status=new_status,
-                        branch=branch,
-                        commit_sha=commit_sha,
+                        branch=branch or None,
+                        commit_sha=commit_sha or None,
                     )
                     actions.append(f"{pt['node_key']}: {pt['status']} -> {new_status}")
 
@@ -423,35 +421,49 @@ class ComposerService:
                                       objective_id=objective_id,
                                       payload={"node_id": pt["node_key"]})
                     elif new_status == "failed":
-                        # Restart failed implementation tasks with incremented attempt
-                        if pt.get("node_key") != "integration":
-                            attempts = pt.get("metadata", {}).get("attempt", 1)
-                            new_attempt = int(attempts) + 1
-                            failure_ctx = ""
+                        # Restart failed tasks with incremented attempt using proper session capture
+                        attempts = pt.get("metadata", {}).get("attempt", 1)
+                        new_attempt = int(attempts) + 1
+                        failure_ctx = ""
+                        session_id = pt.get("metadata", {}).get("session_id", "")
+                        if not session_id:
                             try:
-                                cap = self.agents_gateway.capture_session(
-                                    gw_task.id, lines=50
-                                )
+                                session = self.agents_gateway.get_task_session(gw_task_id)
+                                if session:
+                                    session_id = session.id
+                            except Exception:
+                                pass
+                        if session_id:
+                            try:
+                                cap = self.agents_gateway.capture_session(session_id, lines=50)
                                 if cap and cap.capture:
                                     failure_ctx = cap.capture
                             except Exception:
                                 pass
-                            node = self._find_plan_node(plan, pt.get("node_key", ""))
-                            if node:
-                                result = self.scheduler.restart_failed_task(
-                                    plan, node, spec, objective_id,
-                                    repo_url, base_branch,
-                                    failure_context=failure_ctx,
-                                    attempt=new_attempt,
+                        node = self._find_plan_node(plan, pt.get("node_key", ""))
+                        if node:
+                            result = self.scheduler.restart_failed_task(
+                                plan, node, spec, objective_id,
+                                repo_url, base_branch,
+                                failure_context=failure_ctx,
+                                attempt=new_attempt,
+                            )
+                            if result:
+                                existing_meta = pt.get("metadata", {}) or {}
+                                merged = {**existing_meta,
+                                    "attempt": new_attempt,
+                                    "session_id": session_id or "",
+                                    "failure_context": failure_ctx[:500] if failure_ctx else "",
+                                    "goal": node.goal,
+                                    "ownership_notes": node.ownership_notes,
+                                }
+                                self.storage.update_plan_task(
+                                    pt["id"],
+                                    status="running",
+                                    agents_gateway_task_id=result.get("gw_task_id"),
+                                    metadata=merged,
                                 )
-                                if result:
-                                    self.storage.update_plan_task(
-                                        pt["id"],
-                                        status="running",
-                                        agents_gateway_task_id=result.get("gw_task_id"),
-                                        metadata={"attempt": new_attempt},
-                                    )
-                                    actions.append(f"restarted {pt['node_key']} (attempt {new_attempt})")
+                                actions.append(f"restarted {pt['node_key']} (attempt {new_attempt})")
 
             except Exception as exc:
                 logger.warning("Reconcile failed for task %s: %s", gw_task_id, exc)
@@ -489,7 +501,8 @@ class ComposerService:
             plan_dict, objective_id, agents_gateway_client=self.agents_gateway,
         )
         if completion.complete:
-            await self._finalize_objective(objective_id, plan_dict, spec)
+            await self._finalize_objective(objective_id, plan_dict, spec,
+                                           verification_evidence=completion.verification_evidence)
             actions.append("objective completed")
         elif completion.blocked_external:
             self.storage.update_spec(spec["id"], status="blocked_external")
@@ -506,13 +519,84 @@ class ComposerService:
 
         return {"objective_id": objective_id, "actions": actions}
 
+    async def _extract_branch_commit_evidence(self, gw_task_id: str) -> tuple[str, str]:
+        """Extract branch and commit SHA from GW events and artifacts.
+
+        WorktreeInfo may not carry commit_sha, so we extract from:
+        1. Worktree for branch/path
+        2. Task events — locate latest 'git.committed' event
+        3. result.json artifact — read git.commit_sha
+
+        Returns (branch, commit_sha) — each may be empty if not found.
+        """
+        branch = ""
+        commit_sha = ""
+
+        # 1. Worktree for branch/path
+        try:
+            wt = self.agents_gateway.get_task_worktree(gw_task_id)
+            if wt:
+                branch = wt.branch or ""
+                commit_sha = wt.commit_sha if hasattr(wt, "commit_sha") else ""
+        except Exception:
+            pass
+
+        # 2. Events — locate latest git.committed event
+        if not commit_sha:
+            try:
+                events = self.agents_gateway.get_events(gw_task_id)  # type: ignore[union-attr]
+                for evt in reversed(events):
+                    etype = evt.event if hasattr(evt, "event") else evt.get("event", "")
+                    edata = evt.data if hasattr(evt, "data") else evt.get("data", {})
+                    if etype == "git.committed":
+                        if isinstance(edata, dict):
+                            commit_sha = edata.get("sha", edata.get("commit_sha", ""))
+                            if not branch:
+                                branch = edata.get("branch", "")
+                        break
+            except Exception:
+                pass
+
+        # 3. result.json artifact — read git.commit_sha
+        if not commit_sha:
+            try:
+                raw = self.agents_gateway.download_artifact(gw_task_id, "result.json")  # type: ignore[union-attr]
+                if raw:
+                    result_data = json.loads(raw) if isinstance(raw, bytes) else raw
+                    if isinstance(result_data, dict):
+                        git_info = result_data.get("git", {})
+                        if isinstance(git_info, dict):
+                            commit_sha = git_info.get("commit_sha", "")
+                            if not branch:
+                                branch = git_info.get("branch", "")
+            except Exception:
+                pass
+
+        return (branch, commit_sha)
+
     def _find_plan_node(self, plan: ComposerPlan, node_id: str) -> TaskNode | None:
         for t in plan.tasks:
             if t.node_id == node_id:
                 return t
+        if plan.integration and plan.integration.node_id == node_id:
+            # Build a TaskNode from IntegrationNode for restart purposes
+            return TaskNode(
+                node_id=plan.integration.node_id,
+                title=plan.integration.title,
+                task_type="integration",
+                goal="Integration: combine task branches and run full verification",
+                dependencies=plan.integration.dependencies,
+                harness_profile=self.config.integration_harness_profile,
+                verification=plan.integration.verification,
+                agents_gateway_task_id=plan.integration.agents_gateway_task_id,
+                status=plan.integration.status,
+                branch=plan.integration.branch,
+                commit_sha=plan.integration.commit_sha,
+            )
         return None
 
-    async def _finalize_objective(self, objective_id: str, plan_dict: dict, spec: dict) -> None:
+    async def _finalize_objective(self, objective_id: str, plan_dict: dict, spec: dict,
+                              verification_evidence: list[dict] | None = None) -> None:
         """Generate report and mark objective complete."""
         plan_tasks = plan_dict.get("plan_tasks", [])
         integration_task = next((t for t in plan_tasks if t.get("node_key") == "integration"), None)
@@ -531,7 +615,7 @@ class ComposerService:
                 "commit_sha": t.get("commit_sha"),
             } for t in plan_tasks])
             interactions = self.storage.list_interaction_decisions(objective_id)
-            verif_str = str([t.get("verification") for t in plan_tasks])
+            verif_str = str(verification_evidence or [t.get("verification") for t in plan_tasks])
             summary = await self.llm.create_final_summary(
                 title=title,
                 status="completed",
@@ -549,6 +633,7 @@ class ComposerService:
             final_status="completed",
             final_branch=final_branch,
             final_commit_sha=final_commit,
+            verification_results=verification_evidence or [],
             summary=summary.model_dump() if summary else None,
         )
 
@@ -587,7 +672,7 @@ class ComposerService:
                 "waiting_for_reply": "waiting_for_reply",
                 "verifying": "verifying",
                 "blocked_external": "blocked_external",
-                "stalled": "blocked_external",
+                "stalled": "failed",
                 "created": "pending",
                 "starting": "running",
             }
@@ -722,27 +807,70 @@ class ComposerService:
     async def pause_objective(self, objective_id: str) -> dict | None:
         spec = self.storage.get_spec_by_objective(objective_id)
         if spec:
-            self.storage.update_spec(spec["id"], status="cancelled")
+            self.storage.update_spec(spec["id"], status="paused")
         try:
             return self.conductor_storage.update_objective_status(objective_id, "paused")
         except Exception:
             return None
 
     async def resume_objective(self, objective_id: str) -> dict:
+        spec = self.storage.get_spec_by_objective(objective_id)
+        if spec and spec.get("status") == "paused":
+            prev_status = spec.get("previous_status") or "received"
+            self.storage.update_spec(spec["id"], status=prev_status)
+        try:
+            self.conductor_storage.update_objective_status(objective_id, "active")
+        except Exception:
+            pass
         return await self.start_objective(objective_id)
 
     async def cancel_objective(self, objective_id: str) -> dict | None:
         spec = self.storage.get_spec_by_objective(objective_id)
         if spec:
             self.storage.update_spec(spec["id"], status="cancelled")
+            # Cancel active Agents Gateway tasks
+            plan_dict = self.storage.get_plan_by_objective(objective_id)
+            if plan_dict:
+                for pt in plan_dict.get("plan_tasks", []):
+                    gw_id = pt.get("agents_gateway_task_id")
+                    if gw_id and pt.get("status") in ("running", "dispatching", "pending", "verifying", "waiting_for_reply"):
+                        try:
+                            self.agents_gateway.cancel_task(gw_id)
+                            self.storage.update_plan_task(pt["id"], status="cancelled")
+                        except Exception as exc:
+                            logger.warning("Failed to cancel GW task %s: %s", gw_id, exc)
         try:
             return self.conductor_storage.update_objective_status(objective_id, "cancelled")
         except Exception:
             return None
 
     async def steer_objective(self, objective_id: str, guidance: str) -> dict:
-        """Add steering guidance to an active objective."""
+        """Add steering guidance to an active objective.
+        
+        Steered guidance is persisted and will be included in later planning,
+        task, and interaction context.
+        """
         from conductor.events import emit
         emit(self.conductor_storage, "composer.objective_steered", guidance,
              objective_id=objective_id, source="user")
+        # Persist steering in spec metadata
+        spec = self.storage.get_spec_by_objective(objective_id)
+        if spec:
+            existing_meta = spec.get("metadata") if "metadata" in spec else {}
+            if not isinstance(existing_meta, dict):
+                existing_meta = {}
+            steering_list = existing_meta.get("steering", [])
+            if not isinstance(steering_list, list):
+                steering_list = []
+            steering_list.append({"guidance": guidance, "at": _now_iso()})
+            # Store steering on the raw_spec's metadata in normalized_spec if available,
+            # otherwise on the spec's internal metadata
+            ns = spec.get("normalized_spec", {}) or {}
+            if isinstance(ns, dict):
+                constraints = ns.get("constraints", [])
+                if not isinstance(constraints, list):
+                    constraints = []
+                constraints.append(f"Steering: {guidance}")
+                ns["constraints"] = constraints
+                self.storage.update_spec(spec["id"], normalized_spec=ns)
         return {"objective_id": objective_id, "steered": True}
