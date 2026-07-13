@@ -196,6 +196,9 @@ class TestLLMErrorHandling:
             async def create_final_summary(self, title, status, tasks, interactions, verification):
                 raise LLMError("provider down")
 
+            async def create_repair_plan(self, invalid_plan, errors, context):
+                raise LLMError("provider down")
+
         handler = InteractionHandler(cstorage, ErrorLLM(), gw, conductor_storage=conductor_storage)
         cstorage.create_spec(objective_id, "Test", "raw")
 

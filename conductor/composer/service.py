@@ -110,7 +110,12 @@ class ComposerService:
         repository: dict | None = None,
         auto_start: bool = True,
     ) -> dict:
-        """Submit a finalized specification.  Creates Conductor objective + Composer spec."""
+        """Submit a finalized specification.  Creates Conductor objective + Composer spec
+        and returns immediately — the supervisor drives normalization/planning/dispatch.
+        """
+        repo_url = (repository or {}).get("url", "")
+        base_branch = (repository or {}).get("base_branch", "master")
+
         # Create Conductor objective
         obj_id = f"obj_{_uid()}"
         now = _now_iso()
@@ -127,15 +132,15 @@ class ComposerService:
             obj_id, planner_mode="composer", metadata={"composer": True},
         )
 
-        # Create Composer spec
-        spec = self.storage.create_spec(obj_id, title, raw_spec)
+        # Create Composer spec with persisted repository
+        spec = self.storage.create_spec(obj_id, title, raw_spec, repository_url=repo_url, base_branch=base_branch)
         spec_id = spec["id"]
 
         composer_emit(self.conductor_storage, "composer.objective_received", title,
                       objective_id=obj_id, payload={"spec_id": spec_id})
 
-        if auto_start and self.config.auto_start:
-            await self.start_objective(obj_id)
+        # Mark as ready so the supervisor picks it up — do NOT await normalization/planning
+        self.storage.update_spec(spec_id, status="received")
 
         return {
             "objective_id": obj_id,
@@ -146,21 +151,30 @@ class ComposerService:
     # ── Objective lifecycle ─────────────────────────────────────────────
 
     async def start_objective(self, objective_id: str) -> dict:
-        """Start the Composer pipeline for an objective."""
+        """Start the Composer pipeline for an objective.
+        
+        Does NOT await normalization/planning inline — the supervisor advances
+        the spec through received → normalizing → normalized → planning →
+        planned → executing by calling this incrementally on each tick.
+        """
         spec = self.storage.get_spec_by_objective(objective_id)
         if not spec:
             return {"error": "spec not found", "objective_id": objective_id}
 
-        # Normalize
-        await self._normalize_spec(spec)
-        # Build context
-        await self._build_context(spec, objective_id)
-        # Plan
-        await self._create_and_activate_plan(spec, objective_id)
-        # Dispatch
-        dispatched = await self._dispatch_ready(objective_id)
-        if dispatched:
-            self.storage.update_spec(spec["id"], status="executing")
+        status = spec.get("status", "received")
+
+        if status == "received":
+            await self._normalize_spec(spec)
+
+        spec = self.storage.get_spec_by_objective(objective_id)
+        if spec.get("status") == "normalized":
+            await self._create_and_activate_plan(spec, objective_id)
+
+        spec = self.storage.get_spec_by_objective(objective_id)
+        if spec.get("status") in ("planned",):
+            dispatched = await self._dispatch_ready(objective_id)
+            if dispatched:
+                self.storage.update_spec(spec["id"], status="executing")
 
         return {"objective_id": objective_id, "status": self._get_objective_status(objective_id)}
 
@@ -180,9 +194,17 @@ class ComposerService:
             return spec
 
         normalized_title = result.title or spec["title"]
+
+        # Preserve user-supplied repository over LLM-generated values
+        user_url = spec.get("repository_url", "")
+        user_branch = spec.get("base_branch", "master")
+        llm_repo = result.repository if isinstance(result.repository, dict) else {}
+        repo_url = user_url or llm_repo.get("url", "")
+        repo_branch = user_branch if user_branch != "master" else llm_repo.get("base_branch", user_branch)
+
         normalized = NormalizedSpec(
             goal=result.goal,
-            repository=SpecRepository(**(result.repository if isinstance(result.repository, dict) else {})),
+            repository=SpecRepository(url=repo_url, base_branch=repo_branch),
             requirements=result.requirements,
             acceptance_criteria=result.acceptance_criteria,
             required_live_verification=result.required_live_verification,
@@ -220,6 +242,10 @@ class ComposerService:
         return ctx
 
     async def _create_and_activate_plan(self, spec: dict, objective_id: str) -> dict | None:
+        self.storage.update_spec(spec["id"], status="planning")
+        composer_emit(self.conductor_storage, "composer.planning_started", "",
+                      objective_id=objective_id)
+
         # Build context for planning
         ctx = await self._build_context(spec, objective_id)
         if ctx is None:
@@ -228,27 +254,45 @@ class ComposerService:
         context_str = context_to_prompt(ctx)
         spec_str = str(spec.get("normalized_spec", {}))
 
-        try:
-            plan_result = await self.llm.create_plan(spec=spec_str, context=context_str)
-        except LLMError as exc:
-            logger.error("LLM planning failed: %s", exc)
-            if self.metrics:
-                self.metrics.inc("conductor_composer_llm_errors_total")
-            self.storage.update_spec(spec["id"], status="blocked_external")
-            return None
+        plan_result = None
+        validation = None
+        max_repairs = getattr(self.config, "max_repair_retries", 3)
 
-        composer_emit(self.conductor_storage, "composer.plan_generated", "",
-                      objective_id=objective_id,
-                      payload={"task_count": len(plan_result.tasks)})
+        for attempt in range(max_repairs + 1):
+            try:
+                if attempt == 0:
+                    plan_result = await self.llm.create_plan(spec=spec_str, context=context_str)
+                else:
+                    plan_result = await self.llm.create_repair_plan(
+                        invalid_plan=str(plan_result.model_dump()),
+                        errors="; ".join(validation.errors) if validation else "",
+                        context=context_str,
+                    )
+            except LLMError as exc:
+                logger.error("LLM planning failed: %s", exc)
+                if self.metrics:
+                    self.metrics.inc("conductor_composer_llm_errors_total")
+                self.storage.update_spec(spec["id"], status="blocked_external")
+                return None
 
-        # Validate plan
-        validation = validate_plan_result(plan_result, ctx)
-        if not validation.valid:
+            composer_emit(self.conductor_storage, "composer.plan_generated", "",
+                          objective_id=objective_id,
+                          payload={"task_count": len(plan_result.tasks),
+                                   "attempt": attempt + 1})
+
+            # Validate plan
+            validation = validate_plan_result(plan_result, ctx)
+            if validation.valid:
+                if validation.warnings:
+                    logger.info("Plan validation warnings: %s", validation.warnings)
+                break
+
             composer_emit(self.conductor_storage, "composer.plan_validation_failed",
                           "; ".join(validation.errors),
                           objective_id=objective_id,
-                          payload={"errors": validation.errors})
-            # TODO: repair loop — for now block
+                          payload={"errors": validation.errors, "attempt": attempt + 1})
+        else:
+            # All repair attempts exhausted
             self.storage.update_spec(spec["id"], status="blocked_external")
             return None
 
@@ -319,9 +363,8 @@ class ComposerService:
             return []
 
         plan = self._dict_to_plan(plan_dict)
-        repo_info = spec.get("normalized_spec", {}).get("repository", {})
-        repo_url = repo_info.get("url", "") if isinstance(repo_info, dict) else ""
-        base_branch = repo_info.get("base_branch", "master") if isinstance(repo_info, dict) else "master"
+        repo_url = spec.get("repository_url", "")
+        base_branch = spec.get("base_branch", "master")
 
         dispatched = self.scheduler.dispatch_ready_tasks(
             plan, spec, objective_id, repo_url, base_branch,
@@ -339,6 +382,9 @@ class ComposerService:
 
         plan = self._dict_to_plan(plan_dict)
         actions: list[str] = []
+
+        repo_url = spec.get("repository_url", "")
+        base_branch = spec.get("base_branch", "master")
 
         # Update task statuses from Agents Gateway
         for pt in plan_dict.get("plan_tasks", []):
@@ -376,12 +422,42 @@ class ComposerService:
                         composer_emit(self.conductor_storage, "composer.task_waiting_for_reply", "",
                                       objective_id=objective_id,
                                       payload={"node_id": pt["node_key"]})
+                    elif new_status == "failed":
+                        # Restart failed implementation tasks with incremented attempt
+                        if pt.get("node_key") != "integration":
+                            attempts = pt.get("metadata", {}).get("attempt", 1)
+                            new_attempt = int(attempts) + 1
+                            failure_ctx = ""
+                            try:
+                                cap = self.agents_gateway.capture_session(
+                                    gw_task.id, lines=50
+                                )
+                                if cap and cap.capture:
+                                    failure_ctx = cap.capture
+                            except Exception:
+                                pass
+                            node = self._find_plan_node(plan, pt.get("node_key", ""))
+                            if node:
+                                result = self.scheduler.restart_failed_task(
+                                    plan, node, spec, objective_id,
+                                    repo_url, base_branch,
+                                    failure_context=failure_ctx,
+                                    attempt=new_attempt,
+                                )
+                                if result:
+                                    self.storage.update_plan_task(
+                                        pt["id"],
+                                        status="running",
+                                        agents_gateway_task_id=result.get("gw_task_id"),
+                                        metadata={"attempt": new_attempt},
+                                    )
+                                    actions.append(f"restarted {pt['node_key']} (attempt {new_attempt})")
 
             except Exception as exc:
                 logger.warning("Reconcile failed for task %s: %s", gw_task_id, exc)
 
         # Process interactions
-        spec_dict = spec["normalized_spec"]
+        spec_dict = spec.get("normalized_spec", {})
         decisions = await self.interaction_handler.process_pending_interactions(
             objective_id, plan_dict, spec,
         )
@@ -392,7 +468,6 @@ class ComposerService:
         dispatched = await self._dispatch_ready(objective_id)
         if dispatched:
             actions.append(f"dispatched {len(dispatched)} tasks")
-            # Move spec from planning/planned → executing once we dispatch real tasks
             if spec.get("status") in ("planned", "planning"):
                 self.storage.update_spec(spec["id"], status="executing")
 
@@ -400,11 +475,8 @@ class ComposerService:
         plan_dict = self.storage.get_plan_by_objective(objective_id)  # refreshed
         plan = self._dict_to_plan(plan_dict)
         if self.scheduler.find_integration_ready(plan):
-            repo_info = spec_dict.get("repository", {})
-            repo_url = repo_info.get("url", "") if isinstance(repo_info, dict) else ""
-            base_branch = repo_info.get("base_branch", "master") if isinstance(repo_info, dict) else "master"
             result = self.integration_dispatcher.dispatch_integration(
-                plan, spec, objective_id, repo_url,
+                plan, spec, objective_id, repo_url, base_branch=base_branch,
             )
             if result:
                 actions.append("integration dispatched")
@@ -413,7 +485,9 @@ class ComposerService:
 
         # Check completion
         plan_dict = self.storage.get_plan_by_objective(objective_id)
-        completion = self.verification_contract.check_completion(plan_dict, objective_id)
+        completion = self.verification_contract.check_completion(
+            plan_dict, objective_id, agents_gateway_client=self.agents_gateway,
+        )
         if completion.complete:
             await self._finalize_objective(objective_id, plan_dict, spec)
             actions.append("objective completed")
@@ -432,6 +506,12 @@ class ComposerService:
 
         return {"objective_id": objective_id, "actions": actions}
 
+    def _find_plan_node(self, plan: ComposerPlan, node_id: str) -> TaskNode | None:
+        for t in plan.tasks:
+            if t.node_id == node_id:
+                return t
+        return None
+
     async def _finalize_objective(self, objective_id: str, plan_dict: dict, spec: dict) -> None:
         """Generate report and mark objective complete."""
         plan_tasks = plan_dict.get("plan_tasks", [])
@@ -440,6 +520,28 @@ class ComposerService:
         final_branch = (integration_task.get("branch") or "") if integration_task else ""
         final_commit = (integration_task.get("commit_sha") or "") if integration_task else ""
 
+        # Call final-summary LLM before generating report
+        summary = None
+        try:
+            title = spec.get("title", "") or spec.get("raw_spec", "")[:100]
+            tasks_str = str([{
+                "node_id": t.get("node_key"),
+                "status": t.get("status"),
+                "branch": t.get("branch"),
+                "commit_sha": t.get("commit_sha"),
+            } for t in plan_tasks])
+            interactions = self.storage.list_interaction_decisions(objective_id)
+            verif_str = str([t.get("verification") for t in plan_tasks])
+            summary = await self.llm.create_final_summary(
+                title=title,
+                status="completed",
+                tasks=tasks_str,
+                interactions=str(interactions)[:2000],
+                verification=verif_str,
+            )
+        except Exception as exc:
+            logger.warning("create_final_summary failed: %s", exc)
+
         report = self.report_generator.generate_report(
             objective_id=objective_id,
             spec=spec,
@@ -447,6 +549,7 @@ class ComposerService:
             final_status="completed",
             final_branch=final_branch,
             final_commit_sha=final_commit,
+            summary=summary.model_dump() if summary else None,
         )
 
         self.storage.update_spec(spec["id"], status="completed")
@@ -460,7 +563,7 @@ class ComposerService:
 
         # Update conductor objective
         try:
-            self.conductor_storage.update_objective_status(objective_id, "active")  # may already be active
+            self.conductor_storage.update_objective_status(objective_id, "active")
         except Exception:
             pass
         try:

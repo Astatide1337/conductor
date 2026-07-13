@@ -66,6 +66,9 @@ class ComposerLLMClient(ABC):
     async def create_plan(self, spec: str, context: str) -> PlanResult: ...
 
     @abstractmethod
+    async def create_repair_plan(self, invalid_plan: str, errors: str, context: str) -> PlanResult: ...
+
+    @abstractmethod
     async def answer_interaction(
         self,
         spec: str,
@@ -188,6 +191,10 @@ class FakeComposerLLMClient(ComposerLLMClient):
             },
         )
 
+    async def create_repair_plan(self, invalid_plan: str, errors: str, context: str) -> PlanResult:
+        self._calls.append({"method": "create_repair_plan", "pending_errors": errors[:100]})
+        return await self.create_plan("", "")
+
     async def answer_interaction(
         self,
         spec: str,
@@ -243,9 +250,14 @@ class HttpComposerLLMClient(ComposerLLMClient):
         self._model = model
         self._timeout = timeout
         self._max_tokens = max_tokens
-        self._client = httpx.Client(timeout=timeout)
+        self._client: httpx.AsyncClient | None = None
 
-    def _chat(self, user_msg: str) -> str:
+    async def _ensure_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        return self._client
+
+    async def _chat(self, user_msg: str) -> str:
         """Send a chat/completions request. Returns the assistant message text."""
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -258,8 +270,9 @@ class HttpComposerLLMClient(ComposerLLMClient):
             "temperature": 0.3,
         }
         url = f"{self._base_url}/chat/completions"
+        client = await self._ensure_client()
         try:
-            resp = self._client.post(url, headers=headers, json=body)
+            resp = await client.post(url, headers=headers, json=body)
             resp.raise_for_status()
         except httpx.TimeoutException as exc:
             raise LLMError(f"LLM provider timed out: {exc}") from exc
@@ -274,9 +287,9 @@ class HttpComposerLLMClient(ComposerLLMClient):
             raise LLMError("LLM provider returned no choices")
         return choices[0].get("message", {}).get("content", "")
 
-    def _chat_with_repair(self, user_msg: str, model_cls):
+    async def _chat_with_repair(self, user_msg: str, model_cls):
         """Call _chat, validate, optionally repair, retry."""
-        raw = self._chat(user_msg)
+        raw = await self._chat(user_msg)
         try:
             return _validate_or_raise(raw, model_cls)
         except LLMError:
@@ -289,7 +302,7 @@ class HttpComposerLLMClient(ComposerLLMClient):
                 f"Please respond with ONLY a valid JSON object matching the schema for {model_cls.__name__}.\n\n"
                 f"Previous response:\n{raw[:2000]}"
             )
-            raw = self._chat(repair_msg)
+            raw = await self._chat(repair_msg)
             try:
                 return _validate_or_raise(raw, model_cls)
             except LLMError:
@@ -299,11 +312,21 @@ class HttpComposerLLMClient(ComposerLLMClient):
 
     async def normalize_spec(self, raw_spec: str) -> NormalizedSpecResult:
         prompt = NORMALIZE_PROMPT.format(spec=raw_spec)
-        return self._chat_with_repair(prompt, NormalizedSpecResult)
+        return await self._chat_with_repair(prompt, NormalizedSpecResult)
 
     async def create_plan(self, spec: str, context: str) -> PlanResult:
         prompt = PLAN_PROMPT.format(spec=spec, context=context)
-        return self._chat_with_repair(prompt, PlanResult)
+        return await self._chat_with_repair(prompt, PlanResult)
+
+    async def create_repair_plan(self, invalid_plan: str, errors: str, context: str) -> PlanResult:
+        repair_prompt = (
+            f"A previously generated plan was invalid. Produce a corrected plan that passes validation.\n\n"
+            f"Invalid plan:\n{invalid_plan[:3000]}\n\n"
+            f"Validation errors:\n{errors}\n\n"
+            f"Context:\n{context[:3000]}\n\n"
+            f"Respond with ONLY a valid JSON object matching the PlanResult schema."
+        )
+        return await self._chat_with_repair(repair_prompt, PlanResult)
 
     async def answer_interaction(
         self,
@@ -318,7 +341,7 @@ class HttpComposerLLMClient(ComposerLLMClient):
             interaction=interaction[:2000],
             capture=capture[:2000],
         )
-        return self._chat_with_repair(prompt, InteractionResult)
+        return await self._chat_with_repair(prompt, InteractionResult)
 
     async def create_final_summary(
         self,
@@ -335,7 +358,9 @@ class HttpComposerLLMClient(ComposerLLMClient):
             interactions=interactions[:2000],
             verification=verification[:2000],
         )
-        return self._chat_with_repair(prompt, FinalSummaryResult)
+        return await self._chat_with_repair(prompt, FinalSummaryResult)
 
-    def close(self) -> None:
-        self._client.close()
+    async def close(self) -> None:
+        if self._client:
+            await self._client.aclose()
+            self._client = None

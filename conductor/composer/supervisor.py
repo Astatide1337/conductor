@@ -75,9 +75,16 @@ class ComposerSupervisor:
         active_objectives = self.service.list_objectives(limit=100)
         for obj in active_objectives:
             composer_status = obj.get("composer_status", "")
-            if composer_status in ("received", "normalized", "planning", "planned",
-                                   "planning", "executing", "integrating", "verifying"):
+            if composer_status in ("received", "normalizing", "normalized", "planning", "planned",
+                                   "executing", "integrating", "verifying"):
                 try:
-                    await self.service.reconcile_objective(obj["id"])
+                    if composer_status in ("received", "normalized", "planning", "planned"):
+                        # Start/advance the pipeline for new objectives
+                        await self.service.start_objective(obj["id"])
+                    if composer_status in ("executing", "integrating", "verifying"):
+                        await self.service.reconcile_objective(obj["id"])
+                    # Also reconcile planned objectives to pick up task statuses
+                    if composer_status == "planned":
+                        await self.service.reconcile_objective(obj["id"])
                 except Exception as exc:
                     logger.error("Reconcile failed for %s: %s", obj["id"], exc)

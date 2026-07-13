@@ -48,6 +48,8 @@ class ComposerSpec(BaseModel):
     title: str
     raw_spec: str = ""
     normalized_spec: NormalizedSpec = Field(default_factory=NormalizedSpec)
+    repository_url: str = ""
+    base_branch: str = "master"
     status: str = "received"
     created_at: str = ""
     updated_at: str = ""

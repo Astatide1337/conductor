@@ -181,6 +181,7 @@ class WorktreeInfo:
     agent_run_id: str = ""
     branch: str = ""
     base_branch: str = ""
+    commit_sha: str = ""
     path: str = ""
     status: str = ""
     created_at: str = ""
@@ -509,6 +510,14 @@ class MockAgentsGatewayClient(BaseAgentsGatewayClient):
         return info
 
     # Worktree
+
+    def set_task_worktree(self, task_id: str, branch: str = "",
+                         commit_sha: str = "", status: str = "active") -> WorktreeInfo:
+        wt_id = f"wt-{task_id}"
+        wt = WorktreeInfo(id=wt_id, task_id=task_id, branch=branch or f"composer/branch-{task_id}",
+                          base_branch="master", path=f"/tmp/{wt_id}", commit_sha=commit_sha, status=status)
+        self._worktrees[wt_id] = wt
+        return wt
 
     def get_task_worktree(self, task_id: str) -> WorktreeInfo | None:
         wt_id = f"wt-{task_id}"

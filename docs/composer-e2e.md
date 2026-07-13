@@ -9,14 +9,16 @@ bash scripts/e2e-composer-local.sh
 Uses `FakeComposerLLMClient` + `MockAgentsGatewayClient` for a deterministic,
 offline proof of the full Composer pipeline:
 
-- Spec submitted and normalized
+- Spec submitted async (returns immediately with `status: "received"`)
+- Supervisor advances through received → normalizing → normalized → planning → planned
+- Repository URL and base_branch preserved across all stages
 - Plan generated with 2+ parallel implementation tasks + 1 integration task
-- Tasks dispatched through mock Agents Gateway
+- Tasks dispatched through mock Agents Gateway with distinct worktree identities
 - Reconciliation drives state transitions
 - Timeline populated with events
 - Objective state visible through API
 
-Expected output: `✅ Composer local E2E passed` with all checks passing.
+Expected output: `Composer local E2E passed` with all checks passing.
 
 ## Live E2E (real infrastructure)
 

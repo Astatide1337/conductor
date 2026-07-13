@@ -41,10 +41,14 @@ class IntegrationDispatcher:
         spec: dict,
         objective_id: str,
         repo_url: str = "",
+        base_branch: str | None = None,
     ) -> dict | None:
         """Create the integration task node and dispatch it."""
         if not plan.integration:
             return None
+
+        # Use caller-provided base_branch if given; otherwise fall back to constructor default
+        effective_branch = base_branch if base_branch is not None else self.base_branch
 
         completed_tasks = [t for t in plan.tasks if t.status == "completed"]
 
@@ -61,7 +65,7 @@ class IntegrationDispatcher:
             spec=ns,
             completed_tasks=completed_tasks,
             integration_profile=self.integration_profile,
-            base_branch=self.base_branch,
+            base_branch=effective_branch,
         )
 
         # Check harness availability
@@ -82,7 +86,7 @@ class IntegrationDispatcher:
             "brief": integration_goal,
             "repo": {
                 "url": repo_url,
-                "base_branch": self.base_branch,
+                "base_branch": effective_branch,
             },
             "execution": {
                 "mode": "harness_session",

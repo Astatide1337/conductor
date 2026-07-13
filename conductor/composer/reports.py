@@ -68,6 +68,7 @@ class ReportGenerator:
         pr_url: str | None = None,
         interactions: list[dict] | None = None,
         verification_results: list[dict] | None = None,
+        summary: dict | None = None,
     ) -> dict:
         """Generate HTML + JSON reports.  Returns the report dict."""
         os.makedirs(os.path.join(self.report_dir, objective_id), exist_ok=True)
@@ -75,19 +76,21 @@ class ReportGenerator:
         tasks = (plan or {}).get("plan_tasks", [])
         interactions = interactions or self.storage.list_interaction_decisions(objective_id)
         spec = spec or {}
+        summary = summary or {}
 
         # Redact any credential-shaped substrings to keep secrets out of reports.
         spec = _redact(spec)
         plan = _redact(plan)
         interactions = _redact(interactions)
         verification_results = _redact(verification_results)
+        summary = _redact(summary)
 
         json_report = self._build_json_report(
-            objective_id, spec, plan, final_status, final_branch, final_commit_sha, tasks, interactions, verification_results
+            objective_id, spec, plan, final_status, final_branch, final_commit_sha, tasks, interactions, verification_results, summary
         )
 
         html_report = self._build_html_report(
-            objective_id, spec, plan, final_status, final_branch, final_commit_sha, tasks, interactions, verification_results
+            objective_id, spec, plan, final_status, final_branch, final_commit_sha, tasks, interactions, verification_results, summary
         )
 
         html_path = os.path.join(self.report_dir, objective_id, "review-report.html")
@@ -111,9 +114,9 @@ class ReportGenerator:
         return report
 
     def _build_json_report(
-        self, objective_id, spec, plan, status, branch, commit, tasks, interactions, verification,
+        self, objective_id, spec, plan, status, branch, commit, tasks, interactions, verification, summary,
     ) -> dict:
-        return {
+        result = {
             "objective_id": objective_id,
             "spec": spec,
             "plan": plan,
@@ -134,13 +137,21 @@ class ReportGenerator:
             "interactions": interactions,
             "verification": verification or [],
         }
+        if summary:
+            result["summary"] = summary.get("summary", "")
+            result["assumptions"] = summary.get("assumptions", [])
+            result["blockers"] = summary.get("blockers", [])
+        return result
 
     def _build_html_report(
-        self, objective_id, spec, plan, status, branch, commit, tasks, interactions, verification,
+        self, objective_id, spec, plan, status, branch, commit, tasks, interactions, verification, summary,
     ) -> str:
         ns = spec.get("normalized_spec", {})
         title = spec.get("title", "")
         goal = ns.get("goal", "") if isinstance(ns, dict) else ""
+        summary_text = (summary or {}).get("summary", "")
+        assumptions = (summary or {}).get("assumptions", [])
+        blockers = (summary or {}).get("blockers", [])
 
         task_rows = ""
         for t in tasks:
@@ -171,6 +182,13 @@ class ReportGenerator:
               <td>{v.get('passed', '')}</td>
             </tr>"""
 
+        assumption_rows = ""
+        for a in assumptions:
+            assumption_rows += f"<li>{a}</li>"
+        blocker_rows = ""
+        for b in blockers:
+            blocker_rows += f"<li>{b}</li>"
+
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -198,6 +216,9 @@ class ReportGenerator:
   <p class="meta">Branch: <code>{branch}</code></p>
   <p class="meta">Commit: <code>{commit}</code></p>
 
+  <h2>Executive Summary</h2>
+  <div class="goal">{summary_text}</div>
+
   <h2>Specification</h2>
   <p><strong>{title}</strong></p>
   <div class="goal">{goal}</div>
@@ -213,6 +234,12 @@ class ReportGenerator:
     <tr><th>Action</th><th>Summary</th><th>Reply</th></tr>
     {interaction_rows}
   </table>
+
+  <h2>Assumptions</h2>
+  <ul>{assumption_rows}</ul>
+
+  <h2>Blockers</h2>
+  <ul>{blocker_rows}</ul>
 
   <h2>Verification Matrix</h2>
   <table>

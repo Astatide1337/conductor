@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS composer_specs (
     title TEXT NOT NULL,
     raw_spec TEXT NOT NULL DEFAULT '',
     normalized_spec_json TEXT NOT NULL DEFAULT '{}',
+    repository_url TEXT NOT NULL DEFAULT '',
+    base_branch TEXT NOT NULL DEFAULT 'master',
     status TEXT NOT NULL DEFAULT 'received',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -155,6 +157,8 @@ class ComposerStorage:
         objective_id: str,
         title: str,
         raw_spec: str = "",
+        repository_url: str = "",
+        base_branch: str = "master",
     ) -> dict:
         spec_id = f"spec_{_uid()}"
         now = _now_iso()
@@ -164,9 +168,9 @@ class ComposerStorage:
             conn.row_factory = sqlite3.Row
             conn.execute(
                 """INSERT INTO composer_specs (id, objective_id, title, raw_spec,
-                   normalized_spec_json, status, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (spec_id, objective_id, title, raw_spec, "{}", "received", now, now),
+                   normalized_spec_json, repository_url, base_branch, status, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (spec_id, objective_id, title, raw_spec, "{}", repository_url, base_branch, "received", now, now),
             )
             conn.commit()
         return self.get_spec(spec_id)  # type: ignore
@@ -193,6 +197,8 @@ class ComposerStorage:
         normalized_spec: dict | None = None,
         status: str | None = None,
         title: str | None = None,
+        repository_url: str | None = None,
+        base_branch: str | None = None,
     ) -> dict | None:
         now = _now_iso()
         sets: list[str] = []
@@ -206,6 +212,12 @@ class ComposerStorage:
         if title is not None:
             sets.append("title = ?")
             params.append(title)
+        if repository_url is not None:
+            sets.append("repository_url = ?")
+            params.append(repository_url)
+        if base_branch is not None:
+            sets.append("base_branch = ?")
+            params.append(base_branch)
         params.append(now)
         params.append(spec_id)
         with self._connect() as conn:
@@ -533,6 +545,8 @@ class ComposerStorage:
             "title": row["title"],
             "raw_spec": row["raw_spec"],
             "normalized_spec": normalized,
+            "repository_url": row["repository_url"],
+            "base_branch": row["base_branch"],
             "status": row["status"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],

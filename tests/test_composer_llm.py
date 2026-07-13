@@ -104,6 +104,7 @@ class TestHttpComposerLLMClient:
         )
         assert c._timeout == 42.0
 
-    def test_close(self):
+    @pytest.mark.asyncio
+    async def test_close(self):
         c = HttpComposerLLMClient(base_url="https://api.example.com", api_key="k", model="m")
-        c.close()
+        await c.close()
