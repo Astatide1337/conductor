@@ -302,7 +302,13 @@ class TestRestartFailedTask:
             failure_context="tests failed",
         )
         assert result is not None
-        assert "Previous attempt failed" in node.goal
+        # The GW task's brief should include failure context, but the
+        # durable node.goal must remain the exact planned text.
+        gw_task = scheduler.agents_gateway.get_task(result["gw_task_id"])
+        spec = gw_task.metadata.get("spec", {})
+        goal_text = spec.get("goal", {}).get("text", "") if isinstance(spec.get("goal"), dict) else ""
+        assert "Previous attempt failed" in goal_text
+        assert node.goal == "Original goal"  # durable column unchanged
 
     def test_restart_no_context(self, scheduler, cstorage, conductor_storage):
         from conductor.composer.models import ComposerPlan

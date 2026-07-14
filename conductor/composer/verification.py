@@ -175,7 +175,10 @@ class VerificationContract:
                 })
 
             # Every expected required command must exist and pass.
-            # Matching: by exact name match OR by command lookup (substring reasonable).
+            # IGNORE the downstream command's `required` flag — the Composer
+            # plan is the source of truth.  If the plan says required, it
+            # must exist in actual evidence AND have passed=true.
+            # Matching: by exact name match OR by command substring.
             cmd_list: list[dict] = [
                 c for c in commands if isinstance(c, dict)
             ]
@@ -206,11 +209,36 @@ class VerificationContract:
                         f"missing for {pt.get('node_key', '')}"
                     )
                     continue
-                if actual.get("required", False) and not actual.get("passed", False):
+                # IGNORE actual.get("required") — plan is the authority.
+                if not actual.get("passed", False):
                     reasons.append(
                         f"Required verification '{exp_name or exp_command}' "
                         f"not passed for {pt.get('node_key', '')}"
                     )
+
+            # ── Validate required live_e2e separately ──────────────────
+            live_e2e = verif_spec.get("live_e2e") if isinstance(verif_spec, dict) else None
+            if live_e2e and live_e2e.get("required", False):
+                # Must have matching evidence entry
+                matched = False
+                for ev in evidence:
+                    if ev["node_key"] == pt.get("node_key", "") and ev["name"] == live_e2e.get("name", ""):
+                        matched = True
+                        if not ev.get("passed", False):
+                            # Check if it's a credentials/service issue (blocked_external)
+                            # Heuristic: if output contains "credential" or "auth" or "unauthorized"
+                            cmd_output = ev.get("command", "").lower()
+                            if any(k in cmd_output for k in ("credential", "auth", "unauthorized", "permission", "401", "403")):
+                                return ObjectiveCompletion(
+                                    complete=False, blocked_external=True, failed=False,
+                                    reasons=[f"Required live E2E '{live_e2e.get('name')}' blocked by credentials/service"],
+                                    verification_evidence=evidence,
+                                )
+                            # Otherwise it's a test failure — objective remains uncompleted, repair continues
+                            reasons.append(f"Required live E2E '{live_e2e.get('name')}' failed")
+                        break
+                if not matched:
+                    reasons.append(f"Required live E2E '{live_e2e.get('name')}' evidence missing for {pt.get('node_key', '')}")
 
         complete = len(reasons) == 0
         return ObjectiveCompletion(

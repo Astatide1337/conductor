@@ -136,7 +136,9 @@ def build_composer_context(
 
     # Project context from local repo or MCP gateway
     project_context: dict = {}
-    repo_url = (spec or {}).get("normalized_spec", {}).get("repository", {}).get("url", "") if spec else ""
+    repo_info = spec.get("normalized_spec", {}).get("repository", {}) if spec else {}
+    repo_url = repo_info.get("url", "") if isinstance(repo_info, dict) else ""
+    repo_required = repo_info.get("required", True) if isinstance(repo_info, dict) else True
     if repo_path and os.path.isdir(repo_path):
         project_context = _build_project_context(repo_path)
     elif repo_url and mcp_gateway_client:
@@ -145,12 +147,16 @@ def build_composer_context(
         except Exception as exc:
             logger.warning("Failed to fetch remote repo context: %s", exc)
             project_context["repo_url"] = repo_url
+            project_context["access_error"] = str(exc)
     elif spec and spec.get("normalized_spec", {}).get("repository", {}).get("url"):
         project_context["repo_url"] = spec["normalized_spec"]["repository"]["url"]
 
+    # Propagate required flag for caller to check
+    project_context["repo_required"] = repo_required
+
     return ComposerContext(
         spec=spec or {},
-        repository=(spec or {}).get("normalized_spec", {}).get("repository", {}),
+        repository=repo_info,
         project_context=project_context,
         gateways=gateway_infos,
         capabilities=capability_infos,
@@ -204,28 +210,127 @@ def _build_project_context(repo_path: str) -> dict:
 
 
 def _build_remote_context(mcp_client, repo_url: str) -> dict:
-    """Fetch bounded repo context via MCP Gateway/GitHub capability."""
+    """Fetch bounded repo context via MCP Gateway using list_tools/call_tool.
+
+    Discovers GitHub/repository tools and calls the matching tools for:
+    - README.md, AGENTS.md, CLAUDE.md
+    - docs/architecture.md, ARCHITECTURE.md
+    - tree listing
+
+    Returns dict with context, and optionally repo_required/access_error
+    for required repository failure handling.
+    """
     ctx: dict[str, any] = {"repo_url": repo_url}
-    files_to_fetch = ["README.md", "AGENTS.md", "CLAUDE.md", "docs/architecture.md", "ARCHITECTURE.md"]
+    
+    try:
+        tools = mcp_client.list_tools()
+    except Exception as e:
+        ctx["repo_required"] = True
+        ctx["access_error"] = f"Failed to list MCP tools: {e}"
+        return ctx
+    
+    # Find relevant GitHub/repository tools
+    gh_tools = [t for t in tools if hasattr(t, "name") and "github" in t.name.lower()]
+    if not gh_tools:
+        # Try any tool with "repo" or "file" or "git" in name
+        gh_tools = [t for t in tools if hasattr(t, "name") and ("repo" in t.name.lower() or "file" in t.name.lower() or "git" in t.name.lower())]
+    
+    if not gh_tools:
+        ctx["repo_required"] = True
+        ctx["access_error"] = "No GitHub/repository tool found in MCP Gateway"
+        return ctx
+    
+    # Use first matching tool - typically "github.get_file_contents" or similar
+    tool = gh_tools[0]
+    
+    # Files to fetch
+    files_to_fetch = [
+        "README.md", "AGENTS.md", "CLAUDE.md",
+        "docs/architecture.md", "docs/ARCHITECTURE.md",
+        "ARCHITECTURE.md",
+    ]
+    
+    owner = _extract_owner(repo_url)
+    repo = _extract_repo(repo_url)
+    
+    if not owner or not repo:
+        ctx["repo_required"] = True
+        ctx["access_error"] = f"Could not parse owner/repo from URL: {repo_url}"
+        return ctx
+    
+    any_success = False
     for filename in files_to_fetch:
         try:
-            content = mcp_client.read_file(repo_url, filename)
+            result = mcp_client.call_tool(tool.name, {"owner": owner, "repo": repo, "path": filename})
+            content = _extract_content_from_result(result)
             if content:
+                any_success = True
                 if "README" in filename:
                     ctx["readme"] = content[:4000]
                 elif filename in ("AGENTS.md", "CLAUDE.md"):
                     ctx["agent_instructions"] = ctx.get("agent_instructions", "") + "\n" + content[:2000]
                 elif "architecture" in filename.lower():
                     ctx["architecture_summary"] = content[:4000]
-        except Exception:
+        except Exception as e:
+            # Log but continue - optional files may not exist
             pass
+    
+    # Try to get tree listing
     try:
-        tree = mcp_client.list_files(repo_url, depth=2)
+        result = mcp_client.call_tool(tool.name, {"owner": owner, "repo": repo, "path": ""})
+        tree = _extract_content_from_result(result)
         if tree:
-            ctx["tree_summary"] = tree[:200] if isinstance(tree, list) else str(tree)[:500]
+            if isinstance(tree, list):
+                ctx["tree_summary"] = tree[:200]
+            elif isinstance(tree, dict) and "tree" in tree:
+                ctx["tree_summary"] = [f"{t.get('path', '')}/" if t.get("type") == "tree" else t.get("path", "") for t in tree.get("tree", [])][:200]
     except Exception:
         pass
+    
+    # If no content could be fetched at all and this is a required repo, fail
+    if not any_success:
+        ctx["repo_required"] = True
+        ctx["access_error"] = "No repository content accessible via MCP Gateway"
+    
     return ctx
+
+
+def _extract_owner(repo_url: str) -> str:
+    """Extract owner from GitHub URL."""
+    # Handles: https://github.com/owner/repo, git@github.com:owner/repo.git, etc.
+    import re
+    m = re.search(r"github\.com[/:]([^/]+)/", repo_url)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _extract_repo(repo_url: str) -> str:
+    """Extract repo from GitHub URL."""
+    import re
+    m = re.search(r"github\.com[^/]+/[^/]+/([^/\.]+)", repo_url)
+    if m:
+        return m.group(1)
+    m = re.search(r"github\.com[/:][^/]+/([^/\.]+)", repo_url)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _extract_content_from_result(result: dict) -> str | list | None:
+    """Extract content from MCP tool call result."""
+    if not result:
+        return None
+    # Result shape varies: {"result": "..."} or {"content": "..."} or {"data": "..."}
+    if isinstance(result, dict):
+        for key in ("result", "content", "data", "text"):
+            if key in result and result[key]:
+                val = result[key]
+                if isinstance(val, str):
+                    return val
+                if isinstance(val, (list, dict)):
+                    return val
+    return None
 
 
 def context_to_prompt(ctx: ComposerContext) -> str:

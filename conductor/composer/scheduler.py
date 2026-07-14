@@ -263,9 +263,23 @@ class Scheduler:
         failure_context: str = "",
         attempt: int = 2,
     ) -> dict | None:
-        """Restart a failed task with failure context appended to the goal."""
+        """Restart a failed task with failure context appended to the dispatched brief.
+
+        The original ``node.goal`` is never mutated — failure context is
+        injected into a per-dispatch copy so that the durable SQLite
+        ``goal`` column stays the exact planned text.
+        """
+        from copy import deepcopy
+        dispatched_node = deepcopy(node)
         if failure_context:
-            node.goal = f"{node.goal}\n\nPrevious attempt failed with: {failure_context}\nPlease diagnose and continue working."
+            # Preserve original goal separately (unchanged below).
+            # The metadata_pass into update_plan_task keeps node.goal
+            # so callers can persist attempt history without ever
+            # mutating the source of truth.
+            dispatched_node.goal = (
+                f"{node.goal}\n\nPrevious attempt failed with: "
+                f"{failure_context}\nPlease diagnose and continue working."
+            )
 
         composer_emit(self.conductor_storage or self.storage, "composer.task_restarted", "",
                       objective_id=objective_id,
@@ -274,4 +288,4 @@ class Scheduler:
         if self.metrics:
             self.metrics.inc("conductor_composer_task_restarts_total")
 
-        return self._dispatch_one(node, spec, objective_id, plan.id, repo_url, base_branch, attempt)
+        return self._dispatch_one(dispatched_node, spec, objective_id, plan.id, repo_url, base_branch, attempt)

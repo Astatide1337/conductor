@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS composer_specs (
     repository_url TEXT NOT NULL DEFAULT '',
     base_branch TEXT NOT NULL DEFAULT 'master',
     status TEXT NOT NULL DEFAULT 'received',
+    previous_status TEXT,
+    paused_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (objective_id) REFERENCES objectives(id)
@@ -62,6 +64,9 @@ CREATE TABLE IF NOT EXISTS composer_plan_tasks (
     conductor_task_id TEXT,
     agents_gateway_task_id TEXT,
     task_type TEXT NOT NULL DEFAULT 'implementation',
+    title TEXT NOT NULL DEFAULT '',
+    goal TEXT NOT NULL DEFAULT '',
+    ownership_notes TEXT NOT NULL DEFAULT '',
     dependencies_json TEXT NOT NULL DEFAULT '[]',
     file_scope_json TEXT NOT NULL DEFAULT '[]',
     harness_profile TEXT NOT NULL DEFAULT 'opencode-deepseek',
@@ -73,6 +78,8 @@ CREATE TABLE IF NOT EXISTS composer_plan_tasks (
     commit_sha TEXT,
     artifact_refs_json TEXT NOT NULL DEFAULT '[]',
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    previous_status TEXT,
+    paused_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (plan_id) REFERENCES composer_plans(id)
@@ -140,8 +147,32 @@ class ComposerStorage:
 
         with sqlite3.connect(self.db_path) as conn:
             conn.executescript(COMPOSER_SCHEMA)
+            self._apply_migrations(conn)
             conn.commit()
         self._initialized = True
+
+    # Columns added after initial schema release.  Each migration is
+    # idempotent ( guarded by PRAGMA table_info ) so re-running against
+    # an already-migrated database is a no-op.
+    _MIGRATIONS: list[tuple[str, str, str]] = [
+        ("composer_specs", "previous_status", "TEXT"),
+        ("composer_specs", "paused_at", "TEXT"),
+        ("composer_plan_tasks", "title", "TEXT NOT NULL DEFAULT ''"),
+        ("composer_plan_tasks", "goal", "TEXT NOT NULL DEFAULT ''"),
+        ("composer_plan_tasks", "ownership_notes", "TEXT NOT NULL DEFAULT ''"),
+        ("composer_plan_tasks", "previous_status", "TEXT"),
+        ("composer_plan_tasks", "paused_at", "TEXT"),
+    ]
+
+    def _apply_migrations(self, conn) -> None:
+        existing: dict[str, set[str]] = {}
+        for table, _col, _def in self._MIGRATIONS:
+            if table not in existing:
+                rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+                existing[table] = {r[1] for r in rows}
+            if _col not in existing[table]:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {_col} {_def}")
+                existing[table].add(_col)
 
     def _connect(self):
         import sqlite3
@@ -199,6 +230,8 @@ class ComposerStorage:
         title: str | None = None,
         repository_url: str | None = None,
         base_branch: str | None = None,
+        previous_status: str | None = None,
+        paused_at: str | None = None,
     ) -> dict | None:
         now = _now_iso()
         sets: list[str] = []
@@ -218,6 +251,12 @@ class ComposerStorage:
         if base_branch is not None:
             sets.append("base_branch = ?")
             params.append(base_branch)
+        if previous_status is not None:
+            sets.append("previous_status = ?")
+            params.append(previous_status)
+        if paused_at is not None:
+            sets.append("paused_at = ?")
+            params.append(paused_at)
         params.append(now)
         params.append(spec_id)
         with self._connect() as conn:
@@ -318,23 +357,29 @@ class ComposerStorage:
 
     def _upsert_plan_task(self, conn, plan_id: str, task: dict) -> None:
         now = _now_iso()
-        task_id = f"ptask_{_uid()}"
         node_key = task.get("node_id", "")
         existing = conn.execute(
             "SELECT id FROM composer_plan_tasks WHERE plan_id = ? AND node_key = ?",
             (plan_id, node_key),
         ).fetchone()
         if existing:
-            # Update existing task
+            # Update existing task — preserve durable plan-node identity
+            # fields (title, goal, ownership_notes) unless caller supplies
+            # explicit overrides.
             conn.execute(
                 """UPDATE composer_plan_tasks SET
                    conductor_task_id = ?, agents_gateway_task_id = ?,
+                   task_type = ?, title = ?, goal = ?, ownership_notes = ?,
                    status = ?, branch = ?, commit_sha = ?,
                    artifact_refs_json = ?, metadata_json = ?, updated_at = ?
                    WHERE id = ?""",
                 (
                     task.get("conductor_task_id"),
                     task.get("agents_gateway_task_id"),
+                    task.get("task_type", "implementation"),
+                    task.get("title", ""),
+                    task.get("goal", ""),
+                    task.get("ownership_notes", ""),
                     task.get("status", "pending"),
                     task.get("branch"),
                     task.get("commit_sha"),
@@ -348,16 +393,20 @@ class ComposerStorage:
             conn.execute(
                 """INSERT INTO composer_plan_tasks
                    (id, plan_id, node_key, conductor_task_id, agents_gateway_task_id,
-                    task_type, dependencies_json, file_scope_json, harness_profile,
+                    task_type, title, goal, ownership_notes,
+                    dependencies_json, file_scope_json, harness_profile,
                     required_skills_json, required_capabilities_json, verification_json,
                     status, branch, commit_sha, artifact_refs_json, metadata_json,
                     created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    task_id, plan_id, node_key,
+                    f"ptask_{_uid()}", plan_id, node_key,
                     task.get("conductor_task_id"),
                     task.get("agents_gateway_task_id"),
                     task.get("task_type", "implementation"),
+                    task.get("title", ""),
+                    task.get("goal", ""),
+                    task.get("ownership_notes", ""),
                     json.dumps(task.get("dependencies", [])),
                     json.dumps(task.get("file_scope", [])),
                     task.get("harness_profile", "opencode-deepseek"),
@@ -405,8 +454,13 @@ class ComposerStorage:
         status: str | None = None,
         branch: str | None = None,
         commit_sha: str | None = None,
-        artifact_refs: list | None = None,
+        artifacts: list | None = None,
         metadata: dict | None = None,
+        title: str | None = None,
+        goal: str | None = None,
+        ownership_notes: str | None = None,
+        previous_status: str | None = None,
+        paused_at: str | None = None,
     ) -> dict | None:
         now = _now_iso()
         sets: list[str] = []
@@ -426,12 +480,27 @@ class ComposerStorage:
         if commit_sha is not None:
             sets.append("commit_sha = ?")
             params.append(commit_sha)
-        if artifact_refs is not None:
+        if artifacts is not None:
             sets.append("artifact_refs_json = ?")
-            params.append(json.dumps(artifact_refs))
+            params.append(json.dumps(artifacts))
         if metadata is not None:
             sets.append("metadata_json = ?")
             params.append(json.dumps(metadata))
+        if title is not None:
+            sets.append("title = ?")
+            params.append(title)
+        if goal is not None:
+            sets.append("goal = ?")
+            params.append(goal)
+        if ownership_notes is not None:
+            sets.append("ownership_notes = ?")
+            params.append(ownership_notes)
+        if previous_status is not None:
+            sets.append("previous_status = ?")
+            params.append(previous_status)
+        if paused_at is not None:
+            sets.append("paused_at = ?")
+            params.append(paused_at)
         params.append(now)
         params.append(plan_task_id)
         with self._connect() as conn:
@@ -548,6 +617,8 @@ class ComposerStorage:
             "repository_url": row["repository_url"],
             "base_branch": row["base_branch"],
             "status": row["status"],
+            "previous_status": row["previous_status"] if "previous_status" in row.keys() else None,
+            "paused_at": row["paused_at"] if "paused_at" in row.keys() else None,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -579,6 +650,9 @@ class ComposerStorage:
             "conductor_task_id": row["conductor_task_id"],
             "agents_gateway_task_id": row["agents_gateway_task_id"],
             "task_type": row["task_type"],
+            "title": row["title"] if "title" in row.keys() else "",
+            "goal": row["goal"] if "goal" in row.keys() else "",
+            "ownership_notes": row["ownership_notes"] if "ownership_notes" in row.keys() else "",
             "dependencies": json.loads(row["dependencies_json"]),
             "file_scope": json.loads(row["file_scope_json"]),
             "harness_profile": row["harness_profile"],
@@ -590,6 +664,8 @@ class ComposerStorage:
             "commit_sha": row["commit_sha"],
             "artifact_refs": json.loads(row["artifact_refs_json"]),
             "metadata": json.loads(row["metadata_json"]),
+            "previous_status": row["previous_status"] if "previous_status" in row.keys() else None,
+            "paused_at": row["paused_at"] if "paused_at" in row.keys() else None,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }

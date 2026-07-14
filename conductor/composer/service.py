@@ -241,6 +241,14 @@ class ComposerService:
             mcp_gateway_client=self.mcp_gateway,
         )
 
+        # If required repo could not be accessed, block the objective
+        if repo_url and ctx.project_context.get("repo_required") and ctx.project_context.get("access_error"):
+            error = f"Required repository inaccessible: {ctx.project_context['access_error']}"
+            self.storage.update_spec(spec["id"], status="blocked_external")
+            composer_emit(self.conductor_storage, "composer.objective_blocked_external", error,
+                          objective_id=objective_id, payload={"reason": "repository_access_failed"})
+            return None
+
         composer_emit(self.conductor_storage, "composer.context_built", "",
                       objective_id=objective_id,
                       payload={"harness_count": len(ctx.harness_profiles),
@@ -327,6 +335,8 @@ class ComposerService:
             required=plan_result.integration.required,
             node_id=plan_result.integration.node_id,
             title=plan_result.integration.title,
+            task_type="integration",
+            goal="Integration: combine task branches and run full verification",
             dependencies=plan_result.integration.dependencies,
             verification=plan_result.integration.verification,
         )
@@ -450,12 +460,15 @@ class ComposerService:
                             )
                             if result:
                                 existing_meta = pt.get("metadata", {}) or {}
+                                # Preserve the original planned goal separately from
+                                # the appended failure context so restarts never
+                                # overwrite the source of truth.  The durable
+                                # ``goal`` SQLite column already carries the
+                                # exact planned text.
                                 merged = {**existing_meta,
                                     "attempt": new_attempt,
                                     "session_id": session_id or "",
                                     "failure_context": failure_ctx[:500] if failure_ctx else "",
-                                    "goal": node.goal,
-                                    "ownership_notes": node.ownership_notes,
                                 }
                                 self.storage.update_plan_task(
                                     pt["id"],
@@ -579,12 +592,15 @@ class ComposerService:
             if t.node_id == node_id:
                 return t
         if plan.integration and plan.integration.node_id == node_id:
-            # Build a TaskNode from IntegrationNode for restart purposes
+            # Build a TaskNode from IntegrationNode so the restart logic
+            # can reuse the implementation-task path.  Goal and ownership
+            # notes come straight from the durable IntegrationNode.
             return TaskNode(
                 node_id=plan.integration.node_id,
                 title=plan.integration.title,
                 task_type="integration",
-                goal="Integration: combine task branches and run full verification",
+                goal=plan.integration.goal or "Integration: combine task branches and run full verification",
+                ownership_notes=plan.integration.ownership_notes,
                 dependencies=plan.integration.dependencies,
                 harness_profile=self.config.integration_harness_profile,
                 verification=plan.integration.verification,
@@ -689,7 +705,12 @@ class ComposerService:
         }.get(gw_status, "pending")
 
     def _dict_to_plan(self, plan_dict: dict) -> ComposerPlan:
-        """Reconstruct a ComposerPlan from storage dict."""
+        """Reconstruct a ComposerPlan from storage dict.
+
+        Title, goal, ownership_notes, and task_type are durable SQLite
+        columns now — never reconstruct these from metadata.  The metadata
+        dict still carries transient fields (attempt, session_id, failure_context).
+        """
         plan_tasks = plan_dict.get("plan_tasks", [])
         tasks: list[TaskNode] = []
         integration: IntegrationNode | None = None
@@ -700,9 +721,11 @@ class ComposerService:
                     VerificationCommand(**c) if isinstance(c, dict) else VerificationCommand()
                     for c in verification.get("commands", [])
                 ]
+                live_e2e = verification.get("live_e2e")
                 vs = VerificationSpec(
                     required=verification.get("required", True),
                     commands=commands,
+                    live_e2e=live_e2e,
                 )
             else:
                 vs = VerificationSpec()
@@ -711,7 +734,10 @@ class ComposerService:
                 integration = IntegrationNode(
                     required=True,
                     node_id=pt.get("node_key", "integration"),
-                    title=pt.get("task_type", "integration"),
+                    title=pt.get("title", "") or "Integrate completed task branches",
+                    task_type="integration",
+                    goal=pt.get("goal", "") or "Integration: combine task branches and run full verification",
+                    ownership_notes=pt.get("ownership_notes", ""),
                     dependencies=pt.get("dependencies", []),
                     verification=vs,
                     status=pt.get("status", "pending"),
@@ -723,11 +749,12 @@ class ComposerService:
             else:
                 tasks.append(TaskNode(
                     node_id=pt.get("node_key", ""),
-                    title=pt.get("task_type", ""),
+                    title=pt.get("title", "") or pt.get("task_type", ""),
                     task_type=pt.get("task_type", "implementation"),
-                    goal=pt.get("metadata", {}).get("goal", ""),
+                    goal=pt.get("goal", ""),
                     dependencies=pt.get("dependencies", []),
                     file_scope=pt.get("file_scope", []),
+                    ownership_notes=pt.get("ownership_notes", ""),
                     harness_profile=pt.get("harness_profile", "opencode-deepseek"),
                     required_skills=pt.get("required_skills", []),
                     required_capabilities=pt.get("required_capabilities", []),

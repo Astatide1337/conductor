@@ -30,6 +30,7 @@ class SpecRepository(BaseModel):
     owner: str = ""
     name: str = ""
     base_branch: str = "master"
+    required: bool = True  # if True, inaccessible repo blocks objective
 
 
 class NormalizedSpec(BaseModel):
@@ -141,6 +142,9 @@ class IntegrationNode(BaseModel):
     required: bool = True
     node_id: str = "integration"
     title: str = "Integrate completed task branches"
+    task_type: str = "integration"
+    goal: str = ""
+    ownership_notes: str = ""
     dependencies: list[str] = []
     verification: VerificationSpec = Field(default_factory=VerificationSpec)
     status: str = "pending"
