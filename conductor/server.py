@@ -191,15 +191,15 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         composer_storage.initialize()
 
         is_test_mode = cfg.composer.test_mode or cfg.environment in ("test", "dev")
-        if cfg.composer.llm_api_key and cfg.composer.llm_model:
+        if is_test_mode:
+            llm_client = FakeComposerLLMClient()
+        elif cfg.composer.llm_api_key and cfg.composer.llm_model:
             llm_client = HttpComposerLLMClient(
                 base_url=cfg.composer.llm_base_url,
                 api_key=cfg.composer.llm_api_key,
                 model=cfg.composer.llm_model,
                 timeout=cfg.composer.llm_timeout_seconds,
             )
-        elif is_test_mode:
-            llm_client = FakeComposerLLMClient()
         else:
             raise RuntimeError(
                 "Composer LLM key/model not configured. Set CONDUCTOR_COMPOSER__LLM_API_KEY "

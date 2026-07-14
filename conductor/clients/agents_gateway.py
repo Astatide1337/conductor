@@ -940,3 +940,32 @@ class HttpAgentsGatewayClient(BaseAgentsGatewayClient):
 
     def close(self) -> None:
         self._client.close()
+
+    # ── Artifacts ────────────────────────────────────────────────────────
+
+    def download_artifact(self, task_id: str, artifact_name: str) -> bytes | None:
+        """Download an artifact's bytes through the real artifact-view endpoint.
+
+        1. List task artifacts via GET /tasks/{task_id}/artifacts
+        2. Locate the named artifact
+        3. Fetch it through GET /tasks/{task_id}/artifacts/{artifact_id}/view
+        4. Return the raw bytes
+        """
+        try:
+            artifacts = self.get_artifacts(task_id)
+        except AgentsGatewayError:
+            return None
+
+        target = None
+        for a in artifacts:
+            if a.name == artifact_name:
+                target = a
+                break
+        if target is None:
+            return None
+
+        r = self._request("GET", f"/tasks/{task_id}/artifacts/{target.id}/view")
+        if r.status_code == 404:
+            return None
+        self._raise_for_status(r, f"GET /tasks/{task_id}/artifacts/{target.id}/view")
+        return r.content

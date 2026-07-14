@@ -74,17 +74,28 @@ class ComposerSupervisor:
         """Reconcile all active Composer objectives on each tick.
 
         After a Conductor restart, persisted transitional states must advance
-        idempotently.  start_objective handles received/normalized/planning/planned;
-        reconcile_objective handles executing/integrating/verifying.
+        idempotently.  Each transitional state gets explicit recovery:
+
+        - normalizing  → safely rerun normalization
+        - normalized   → proceed to planning
+        - planning     → safely rerun planning (idempotent)
+        - planned      → dispatch ready tasks
+        - dispatching  → reconcile using idempotency key
+        - executing    → reconcile tasks
+        - integrating  → reconcile integration
+        - verifying    → refetch verification evidence
 
         Objectives with composer_auto_start=False remain pending until
         explicitly started via POST /composer/objectives/{id}/start.
+
+        Pause/resume preserves previous_status and paused_at so the exact
+        prior state is restored — no second plan, no normalization rerun.
         """
         active_objectives = self.service.list_objectives(limit=100)
         for obj in active_objectives:
             composer_status = obj.get("composer_status", "")
             if composer_status in ("received", "normalizing", "normalized", "planning", "planned",
-                                   "executing", "integrating", "verifying"):
+                                   "dispatching", "executing", "integrating", "verifying"):
 
                 # auto_start=false objects must remain at 'received' until explicit start
                 meta = obj.get("metadata", {}) or {}
@@ -94,7 +105,7 @@ class ComposerSupervisor:
                 try:
                     if composer_status in ("received", "normalizing", "normalized", "planning", "planned"):
                         await self.service.start_objective(obj["id"])
-                    if composer_status in ("executing", "integrating", "verifying"):
+                    if composer_status in ("dispatching", "executing", "integrating", "verifying"):
                         await self.service.reconcile_objective(obj["id"])
                     if composer_status == "planned":
                         await self.service.reconcile_objective(obj["id"])

@@ -147,14 +147,62 @@ def _load_yaml(path: str | None) -> dict:
 
 def _env_overrides() -> dict:
     overrides: dict = {}
+
+    # Standard double-underscore nesting: CONDUCTOR_COMPOSER__LLM_BASE_URL → composer.llm_base_url
     for key, value in sorted(os.environ.items()):
         if key.startswith("CONDUCTOR_"):
             config_key = key[len("CONDUCTOR_") :].lower()
             parts = config_key.split("__")
+            if len(parts) > 1:
+                current = overrides
+                for part in parts[:-1]:
+                    current = current.setdefault(part, {})
+                current[parts[-1]] = value
+            elif config_key == "environment":
+                overrides["environment"] = value
+
+    # Backward-compatible single-underscore aliases (e.g. CONDUCTOR_COMPOSER_LLM_BASE_URL)
+    _ALIASES = {
+        "composer_llm_base_url": ("composer", "llm_base_url"),
+        "composer_llm_api_key": ("composer", "llm_api_key"),
+        "composer_llm_model": ("composer", "llm_model"),
+        "composer_llm_timeout_seconds": ("composer", "llm_timeout_seconds"),
+        "composer_enabled": ("composer", "enabled"),
+        "composer_max_parallel_tasks": ("composer", "max_parallel_tasks"),
+        "composer_max_repair_retries": ("composer", "max_repair_retries"),
+        "composer_poll_interval_seconds": ("composer", "poll_interval_seconds"),
+        "composer_default_harness_profile": ("composer", "default_harness_profile"),
+        "composer_integration_harness_profile": ("composer", "integration_harness_profile"),
+        "composer_auto_start": ("composer", "auto_start"),
+        "composer_report_dir": ("composer", "report_dir"),
+        "agents_gateway_url": ("agents_gateway", "url"),
+        "agents_gateway_auth_mode": ("agents_gateway", "auth_mode"),
+        "agents_gateway_internal_token": ("agents_gateway", "internal_token"),
+        "agents_gateway_timeout_seconds": ("agents_gateway", "timeout_seconds"),
+        "skills_gateway_url": ("skills_gateway", "url"),
+        "skills_gateway_auth_mode": ("skills_gateway", "auth_mode"),
+        "skills_gateway_internal_token": ("skills_gateway", "internal_token"),
+        "mcp_gateway_url": ("mcp_gateway", "url"),
+        "mcp_gateway_auth_mode": ("mcp_gateway", "auth_mode"),
+        "mcp_gateway_internal_token": ("mcp_gateway", "internal_token"),
+        "wiki_mcp_url": ("wiki_mcp", "url"),
+        "wiki_mcp_auth_mode": ("wiki_mcp", "auth_mode"),
+        "wiki_mcp_internal_token": ("wiki_mcp", "internal_token"),
+        "storage_sqlite_path": ("storage", "sqlite_path"),
+        "service_host": ("service", "host"),
+        "service_port": ("service", "port"),
+    }
+    for key, value in sorted(os.environ.items()):
+        if not key.startswith("CONDUCTOR_"):
+            continue
+        config_key = key[len("CONDUCTOR_") :].lower()
+        if "__" not in config_key and config_key in _ALIASES:
+            path = _ALIASES[config_key]
             current = overrides
-            for part in parts[:-1]:
+            for part in path[:-1]:
                 current = current.setdefault(part, {})
-            current[parts[-1]] = value
+            current[path[-1]] = value
+
     return overrides
 
 

@@ -69,6 +69,7 @@ class ReportGenerator:
         interactions: list[dict] | None = None,
         verification_results: list[dict] | None = None,
         summary: dict | None = None,
+        downstream_artifacts: list[dict] | None = None,
     ) -> dict:
         """Generate HTML + JSON reports.  Returns the report dict."""
         os.makedirs(os.path.join(self.report_dir, objective_id), exist_ok=True)
@@ -77,6 +78,7 @@ class ReportGenerator:
         interactions = interactions or self.storage.list_interaction_decisions(objective_id)
         spec = spec or {}
         summary = summary or {}
+        downstream_artifacts = downstream_artifacts or []
 
         # Redact any credential-shaped substrings to keep secrets out of reports.
         spec = _redact(spec)
@@ -84,13 +86,14 @@ class ReportGenerator:
         interactions = _redact(interactions)
         verification_results = _redact(verification_results)
         summary = _redact(summary)
+        downstream_artifacts = _redact(downstream_artifacts)
 
         json_report = self._build_json_report(
-            objective_id, spec, plan, final_status, final_branch, final_commit_sha, tasks, interactions, verification_results, summary
+            objective_id, spec, plan, final_status, final_branch, final_commit_sha, tasks, interactions, verification_results, summary, downstream_artifacts
         )
 
         html_report = self._build_html_report(
-            objective_id, spec, plan, final_status, final_branch, final_commit_sha, tasks, interactions, verification_results, summary
+            objective_id, spec, plan, final_status, final_branch, final_commit_sha, tasks, interactions, verification_results, summary, downstream_artifacts
         )
 
         html_path = os.path.join(self.report_dir, objective_id, "review-report.html")
@@ -115,6 +118,7 @@ class ReportGenerator:
 
     def _build_json_report(
         self, objective_id, spec, plan, status, branch, commit, tasks, interactions, verification, summary,
+        downstream_artifacts=None,
     ) -> dict:
         result = {
             "objective_id": objective_id,
@@ -126,7 +130,7 @@ class ReportGenerator:
             "task_graph": [
                 {
                     "node_id": t.get("node_key", ""),
-                    "title": "",
+                    "title": t.get("title", ""),
                     "status": t.get("status", ""),
                     "branch": t.get("branch"),
                     "commit_sha": t.get("commit_sha"),
@@ -136,6 +140,7 @@ class ReportGenerator:
             ],
             "interactions": interactions,
             "verification": verification or [],
+            "downstream_artifacts": downstream_artifacts or [],
         }
         if summary:
             result["summary"] = summary.get("summary", "")
@@ -145,6 +150,7 @@ class ReportGenerator:
 
     def _build_html_report(
         self, objective_id, spec, plan, status, branch, commit, tasks, interactions, verification, summary,
+        downstream_artifacts=None,
     ) -> str:
         ns = spec.get("normalized_spec", {})
         title = spec.get("title", "")
@@ -152,6 +158,7 @@ class ReportGenerator:
         summary_text = (summary or {}).get("summary", "")
         assumptions = (summary or {}).get("assumptions", [])
         blockers = (summary or {}).get("blockers", [])
+        downstream_artifacts = downstream_artifacts or []
 
         task_rows = ""
         for t in tasks:
@@ -182,12 +189,39 @@ class ReportGenerator:
               <td>{v.get('passed', '')}</td>
             </tr>"""
 
+        artifact_rows = ""
+        for da in downstream_artifacts:
+            node_key = da.get("node_key", "")
+            gw_task_id = da.get("gw_task_id", "")
+            for art in da.get("artifacts", []):
+                artifact_rows += f"""
+                <tr>
+                  <td>{node_key}</td>
+                  <td>{gw_task_id}</td>
+                  <td>{art.get('name', '')}</td>
+                  <td>{art.get('artifact_type', '')}</td>
+                  <td>{art.get('size_bytes', 0)}</td>
+                </tr>"""
+
         assumption_rows = ""
         for a in assumptions:
             assumption_rows += f"<li>{a}</li>"
         blocker_rows = ""
         for b in blockers:
             blocker_rows += f"<li>{b}</li>"
+
+        artifacts_section = (
+            """
+  <h2>Downstream Agents Gateway Artifacts</h2>
+  <table>
+    <tr><th>Node</th><th>GW Task ID</th><th>Artifact</th><th>Type</th><th>Size (bytes)</th></tr>
+    """ + artifact_rows + """
+  </table>"""
+            if artifact_rows
+            else """
+  <h2>Downstream Agents Gateway Artifacts</h2>
+  <p>No downstream artifacts collected.</p>"""
+        )
 
         return f"""<!DOCTYPE html>
 <html lang="en">
@@ -246,6 +280,7 @@ class ReportGenerator:
     <tr><th>Name</th><th>Status</th><th>Passed</th></tr>
     {verification_rows}
   </table>
+{artifacts_section}
 
   <h2>Final Result</h2>
   <p>Status: <span class="status-{status}">{status}</span></p>

@@ -13,6 +13,7 @@ services:
       - CONDUCTOR_OBSERVABILITY__LOG_FORMAT=${CONDUCTOR_LOG_FORMAT:-json}
       - CONDUCTOR_OBSERVABILITY__LOG_LEVEL=${CONDUCTOR_LOG_LEVEL:-INFO}
       - CONDUCTOR_ENVIRONMENT=${CONDUCTOR_ENVIRONMENT:-production}
+      - CONDUCTOR_COMPOSER__TEST_MODE=${CONDUCTOR_COMPOSER_TEST_MODE:-false}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8093/health').read()"]

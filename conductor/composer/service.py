@@ -93,6 +93,7 @@ class ComposerService:
         self.interaction_handler = InteractionHandler(
             storage, llm_client, agents_gateway_client, metrics=metrics,
             conductor_storage=conductor_storage,
+            scheduler=self.scheduler,
         )
         self.integration_dispatcher = IntegrationDispatcher(
             storage,
@@ -157,10 +158,16 @@ class ComposerService:
 
     async def start_objective(self, objective_id: str) -> dict:
         """Start the Composer pipeline for an objective.
-        
-        Does NOT await normalization/planning inline — the supervisor advances
-        the spec through received → normalizing → normalized → planning →
-        planned → executing by calling this incrementally on each tick.
+
+        Idempotent per transitional state — safe to call repeatedly from
+        the supervisor after a process restart.  Each state is advanced
+        exactly one step per call:
+
+        - received    → normalize
+        - normalizing → normalize (safe rerun)
+        - normalized   → create and activate plan
+        - planning     → create and activate plan (safe rerun / restore draft)
+        - planned      → dispatch ready tasks
         """
         spec = self.storage.get_spec_by_objective(objective_id)
         if not spec:
@@ -168,15 +175,23 @@ class ComposerService:
 
         status = spec.get("status", "received")
 
-        if status == "received":
+        # Paused objectives must not be advanced by the supervisor
+        if status == "paused":
+            return {"objective_id": objective_id, "status": "paused"}
+
+        if status in ("received", "normalizing"):
             await self._normalize_spec(spec)
 
         spec = self.storage.get_spec_by_objective(objective_id)
-        if spec.get("status") == "normalized":
+        status = spec.get("status", "received")
+
+        if status in ("normalized", "planning"):
             await self._create_and_activate_plan(spec, objective_id)
 
         spec = self.storage.get_spec_by_objective(objective_id)
-        if spec.get("status") in ("planned",):
+        status = spec.get("status", "received")
+
+        if status in ("planned",):
             dispatched = await self._dispatch_ready(objective_id)
             if dispatched:
                 self.storage.update_spec(spec["id"], status="executing")
@@ -481,6 +496,14 @@ class ComposerService:
             except Exception as exc:
                 logger.warning("Reconcile failed for task %s: %s", gw_task_id, exc)
 
+        # ── Evidence recovery pass (independent of status changes) ──
+        # For every completed task with missing branch/commit_sha, repeatedly
+        # attempt to recover evidence.  This is separate from the status-
+        # update loop above — it runs even when status hasn't changed.
+        evidence_recovered = await self._recover_missing_evidence(plan_dict, objective_id)
+        if evidence_recovered:
+            actions.append(f"recovered evidence for {evidence_recovered}")
+
         # Process interactions
         spec_dict = spec.get("normalized_spec", {})
         decisions = await self.interaction_handler.process_pending_interactions(
@@ -587,6 +610,95 @@ class ComposerService:
 
         return (branch, commit_sha)
 
+    async def _recover_missing_evidence(self, plan_dict: dict, objective_id: str) -> int:
+        """Recover missing evidence for completed tasks independently of status transitions.
+
+        For every completed task with missing branch/commit_sha, repeatedly
+        attempt to recover evidence.  This runs on every reconcile pass —
+        not just when status changes — because GW events and artifacts may
+        arrive with a delay.
+        """
+        recovered = 0
+        for pt in plan_dict.get("plan_tasks", []):
+            if pt.get("status") != "completed":
+                continue
+            gw_task_id = pt.get("agents_gateway_task_id")
+            if not gw_task_id:
+                continue
+            branch = pt.get("branch", "") or ""
+            commit_sha = pt.get("commit_sha", "") or ""
+            if branch and commit_sha:
+                continue
+            try:
+                new_branch, new_commit = await self._extract_branch_commit_evidence(gw_task_id)
+            except Exception:
+                continue
+            updated = False
+            if new_branch and not branch:
+                branch = new_branch
+                updated = True
+            if new_commit and not commit_sha:
+                commit_sha = new_commit
+                updated = True
+            if updated:
+                self.storage.update_plan_task(
+                    pt["id"],
+                    branch=branch or None,
+                    commit_sha=commit_sha or None,
+                )
+                recovered += 1
+        return recovered
+
+    def _collect_downstream_artifacts(self, plan_tasks: list[dict]) -> list[dict]:
+        """Collect downstream Agents Gateway artifacts per task.
+
+        For each task with a GW task ID, list the actual artifacts from
+        GW (HTML report, result.json, terminal/session log, verification
+        logs, screenshots, videos, and other proof artifacts) so the
+        Composer report can reference them.
+        """
+        artifacts_by_task: list[dict] = []
+        for pt in plan_tasks:
+            gw_task_id = pt.get("agents_gateway_task_id")
+            if not gw_task_id:
+                continue
+            node_key = pt.get("node_key", "")
+            task_artifacts: list[dict] = []
+            try:
+                gw_arts = self.agents_gateway.get_artifacts(gw_task_id)
+                for a in gw_arts:
+                    task_artifacts.append({
+                        "name": a.name,
+                        "id": a.id,
+                        "path": a.path,
+                        "size_bytes": a.size_bytes,
+                        "artifact_type": a.artifact_type,
+                        "created_at": a.created_at,
+                    })
+            except Exception as exc:
+                logger.debug("No artifacts for GW task %s: %s", gw_task_id, exc)
+
+            # Also reference verification data
+            try:
+                verif = self.agents_gateway.get_verification(gw_task_id)
+                task_artifacts.append({
+                    "name": "verification",
+                    "id": verif.id if hasattr(verif, "id") else "",
+                    "path": "",
+                    "size_bytes": 0,
+                    "artifact_type": "verification",
+                    "created_at": getattr(verif, "completed_at", "") if hasattr(verif, "completed_at") else "",
+                })
+            except Exception:
+                pass
+
+            artifacts_by_task.append({
+                "node_key": node_key,
+                "gw_task_id": gw_task_id,
+                "artifacts": task_artifacts,
+            })
+        return artifacts_by_task
+
     def _find_plan_node(self, plan: ComposerPlan, node_id: str) -> TaskNode | None:
         for t in plan.tasks:
             if t.node_id == node_id:
@@ -620,6 +732,9 @@ class ComposerService:
         final_branch = (integration_task.get("branch") or "") if integration_task else ""
         final_commit = (integration_task.get("commit_sha") or "") if integration_task else ""
 
+        # Aggregate downstream Agents Gateway artifacts per task
+        downstream_artifacts = self._collect_downstream_artifacts(plan_tasks)
+
         # Call final-summary LLM before generating report
         summary = None
         try:
@@ -651,6 +766,7 @@ class ComposerService:
             final_commit_sha=final_commit,
             verification_results=verification_evidence or [],
             summary=summary.model_dump() if summary else None,
+            downstream_artifacts=downstream_artifacts,
         )
 
         self.storage.update_spec(spec["id"], status="completed")
@@ -832,24 +948,77 @@ class ComposerService:
     # ── Control ─────────────────────────────────────────────────────────
 
     async def pause_objective(self, objective_id: str) -> dict | None:
+        """Pause the objective — persist previous_status and paused_at.
+
+        Pause must:
+        - prevent new dispatches (supervisor skips paused)
+        - preserve active task and plan state (no cancellation)
+        - record the exact prior status for exact resume
+        """
         spec = self.storage.get_spec_by_objective(objective_id)
-        if spec:
-            self.storage.update_spec(spec["id"], status="paused")
+        if spec and spec.get("status") != "paused":
+            from datetime import UTC, datetime
+            paused_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            self.storage.update_spec(
+                spec["id"],
+                status="paused",
+                previous_status=spec.get("status", "received"),
+                paused_at=paused_at,
+            )
+            composer_emit(self.conductor_storage, "composer.objective_paused", "",
+                          objective_id=objective_id,
+                          payload={"previous_status": spec.get("status", "")})
         try:
             return self.conductor_storage.update_objective_status(objective_id, "paused")
         except Exception:
             return None
 
     async def resume_objective(self, objective_id: str) -> dict:
+        """Resume the objective — restore exact prior state.
+
+        Resume must:
+        - restore the exact previous_status (no second plan, no normalization rerun)
+        - keep the same plan and task IDs
+        - continue reconciliation from where it left off
+
+        For pre-executing states (received, normalized, planning, planned),
+        start_objective advances through the pipeline idempotently without
+        creating a second plan — it checks the current spec status and only
+        proceeds to the next phase.
+
+        For executing/integrating/verifying states, only reconcile is called
+        — no plan or normalization is reinstated.
+        """
         spec = self.storage.get_spec_by_objective(objective_id)
+        prev_status = ""
         if spec and spec.get("status") == "paused":
-            prev_status = spec.get("previous_status") or "received"
+            prev_status = spec.get("previous_status") or "executing"
+            # Restore the exact prior status
             self.storage.update_spec(spec["id"], status=prev_status)
+            composer_emit(self.conductor_storage, "composer.objective_resumed", "",
+                          objective_id=objective_id,
+                          payload={"restored_status": prev_status})
+        else:
+            prev_status = spec.get("status", "") if spec else ""
         try:
             self.conductor_storage.update_objective_status(objective_id, "active")
         except Exception:
             pass
-        return await self.start_objective(objective_id)
+
+        # Resume to executing/integrating/verifying/dispatching: just reconcile,
+        # no normalization/planning rerun.  The plan and task IDs are already
+        # in SQLite from the pause.
+        if prev_status in ("executing", "integrating", "verifying", "dispatching"):
+            return await self.reconcile_objective(objective_id)
+
+        # Resume to pre-executing states: start_objective advances idempotently.
+        # For received -> normalize.  For.normalized -> plan.  For planned -> dispatch.
+        # If a plan already exists, _create_and_activate_plan checks spec.status
+        # == "normalized" and won't create a second plan.
+        if prev_status in ("received", "normalizing", "normalized", "planning", "planned"):
+            return await self.start_objective(objective_id)
+
+        return {"objective_id": objective_id, "status": self._get_objective_status(objective_id)}
 
     async def cancel_objective(self, objective_id: str) -> dict | None:
         spec = self.storage.get_spec_by_objective(objective_id)

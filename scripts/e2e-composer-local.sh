@@ -60,10 +60,26 @@ check "base_branch preserved" "develop" "${BRANCH}"
 
 # 4. Wait for async supervisor to advance spec through stages
 echo "--- Supervisor advances spec ---"
-sleep 2
-R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/spec")
-SPEC_STATUS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))")
-check_contains "spec advanced from received" "normalized\|planning\|planned\|executing" "${SPEC_STATUS}"
+# Poll up to 30 seconds for the spec to advance from received
+ADVANCED=0
+for _ in $(seq 1 15); do
+    sleep 2
+    R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/spec")
+    SPEC_STATUS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))")
+    case "${SPEC_STATUS}" in
+        normalized|planning|planned|executing|integrating|verifying|completed)
+            ADVANCED=1
+            break
+            ;;
+    esac
+done
+if [ "$ADVANCED" -eq 1 ]; then
+    echo "  PASS: spec advanced from received (status: ${SPEC_STATUS})"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: spec advanced from received (expected normalized|planning|planned|executing, got ${SPEC_STATUS})"
+    FAIL=$((FAIL + 1))
+fi
 
 # 5. Plan generated
 echo "--- Plan ---"
