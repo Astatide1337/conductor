@@ -175,6 +175,26 @@ class VerificationInfo:
     metadata: dict = field(default_factory=dict)
 
 
+def _coerce_verification_command(cmd: dict) -> dict:
+    """Pass through the runtime-evidence fields of a verification command.
+
+    Carries exit_code, blocked, blocked_reason, output_artifact, and
+    duration_seconds verbatim from the gateway response — never infer
+    blocker type from the command string.
+    """
+    return {
+        "name": cmd.get("name", ""),
+        "command": cmd.get("command", ""),
+        "passed": cmd.get("passed", False),
+        "required": cmd.get("required", False),
+        "exit_code": cmd.get("exit_code"),
+        "blocked": bool(cmd.get("blocked", False)),
+        "blocked_reason": cmd.get("blocked_reason", ""),
+        "output_artifact": cmd.get("output_artifact", ""),
+        "duration_seconds": cmd.get("duration_seconds"),
+    }
+
+
 @dataclass
 class WorktreeInfo:
     id: str = ""
@@ -913,7 +933,7 @@ class HttpAgentsGatewayClient(BaseAgentsGatewayClient):
             status=data.get("status", "pending"),
             started_at=data.get("started_at", ""),
             completed_at=data.get("completed_at", ""),
-            commands=data.get("commands", []),
+            commands=[_coerce_verification_command(c) for c in data.get("commands", []) if isinstance(c, dict)],
             metadata=data.get("metadata", {}),
         )
 
@@ -946,9 +966,13 @@ class HttpAgentsGatewayClient(BaseAgentsGatewayClient):
     def download_artifact(self, task_id: str, artifact_name: str) -> bytes | None:
         """Download an artifact's bytes through the real artifact-view endpoint.
 
+        Aligns with the actual Agents Gateway artifact-content API:
+
         1. List task artifacts via GET /tasks/{task_id}/artifacts
         2. Locate the named artifact
-        3. Fetch it through GET /tasks/{task_id}/artifacts/{artifact_id}/view
+        3. Fetch the bytes via GET /artifacts/{artifact_id}?view=true
+           (NOT /tasks/{task_id}/artifacts/{artifact_id}/view — that route
+           does not exist on the downstream service)
         4. Return the raw bytes
         """
         try:
@@ -964,8 +988,8 @@ class HttpAgentsGatewayClient(BaseAgentsGatewayClient):
         if target is None:
             return None
 
-        r = self._request("GET", f"/tasks/{task_id}/artifacts/{target.id}/view")
-        if r.status_code == 404:
+        r = self._request("GET", f"/artifacts/{target.id}?view=true")
+        if r.status_code in (404, 410):
             return None
-        self._raise_for_status(r, f"GET /tasks/{task_id}/artifacts/{target.id}/view")
+        self._raise_for_status(r, f"GET /artifacts/{target.id}?view=true")
         return r.content

@@ -212,87 +212,305 @@ def _build_project_context(repo_path: str) -> dict:
 def _build_remote_context(mcp_client, repo_url: str) -> dict:
     """Fetch bounded repo context via MCP Gateway using list_tools/call_tool.
 
-    Discovers GitHub/repository tools and calls the matching tools for:
-    - README.md, AGENTS.md, CLAUDE.md
-    - docs/architecture.md, ARCHITECTURE.md
-    - tree listing
+    Selects tools by contract — inspects discovered tools' names,
+    descriptions, AND input schemas — so that the first tool whose name
+    merely contains ``github`` (e.g. ``github.search``) is NOT used to
+    read file content.  Instead:
 
-    Returns dict with context, and optionally repo_required/access_error
-    for required repository failure handling.
+      * file-content tools (must accept a ``path`` parameter AND
+        have a name/description indicating file content reading):
+        ``get_file_contents``, ``fetch_file``, ``read_repository_file``
+        are preferred explicitly.  An ``input_schema`` showing
+        ``properties.path`` is required.
+      * tree/listing tools (must NOT require a ``path`` parameter;
+        name/description indicating listing): ``list_files``,
+        ``get_file_tree``, ``list_repository_files`` are preferred.
+
+    The two categories are picked separately and used for their
+    respective calls — never the same tool for both.
     """
-    ctx: dict[str, any] = {"repo_url": repo_url}
-    
+    ctx: dict = {"repo_url": repo_url}
+
     try:
         tools = mcp_client.list_tools()
     except Exception as e:
         ctx["repo_required"] = True
         ctx["access_error"] = f"Failed to list MCP tools: {e}"
         return ctx
-    
-    # Find relevant GitHub/repository tools
-    gh_tools = [t for t in tools if hasattr(t, "name") and "github" in t.name.lower()]
-    if not gh_tools:
-        # Try any tool with "repo" or "file" or "git" in name
-        gh_tools = [t for t in tools if hasattr(t, "name") and ("repo" in t.name.lower() or "file" in t.name.lower() or "git" in t.name.lower())]
-    
-    if not gh_tools:
+
+    file_tool = _select_file_content_tool(tools)
+    tree_tool = _select_tree_listing_tool(tools)
+
+    if not file_tool and not tree_tool:
         ctx["repo_required"] = True
-        ctx["access_error"] = "No GitHub/repository tool found in MCP Gateway"
+        ctx["access_error"] = (
+            "No file-content or tree-listing tool found in MCP Gateway "
+            "(inspected tool names, descriptions, and input schemas)")
         return ctx
-    
-    # Use first matching tool - typically "github.get_file_contents" or similar
-    tool = gh_tools[0]
-    
-    # Files to fetch
+
     files_to_fetch = [
         "README.md", "AGENTS.md", "CLAUDE.md",
         "docs/architecture.md", "docs/ARCHITECTURE.md",
         "ARCHITECTURE.md",
     ]
-    
+
     owner = _extract_owner(repo_url)
     repo = _extract_repo(repo_url)
-    
+
     if not owner or not repo:
         ctx["repo_required"] = True
         ctx["access_error"] = f"Could not parse owner/repo from URL: {repo_url}"
         return ctx
-    
+
     any_success = False
-    for filename in files_to_fetch:
+    if file_tool is not None:
+        for filename in files_to_fetch:
+            try:
+                args = _build_file_tool_args(file_tool, owner, repo, filename)
+                result = mcp_client.call_tool(file_tool.name, args)
+                content = _extract_content_from_result(result)
+                if content:
+                    any_success = True
+                    if "README" in filename:
+                        ctx["readme"] = content[:4000]
+                    elif filename in ("AGENTS.md", "CLAUDE.md"):
+                        ctx["agent_instructions"] = (
+                            ctx.get("agent_instructions", "") + "\n" + content[:2000]
+                        )
+                    elif "architecture" in filename.lower():
+                        ctx["architecture_summary"] = content[:4000]
+            except Exception:
+                # Optional files may not exist — log and move on.
+                pass
+
+    # Tree listing via the dedicated tool, never the file-content tool.
+    if tree_tool is not None:
         try:
-            result = mcp_client.call_tool(tool.name, {"owner": owner, "repo": repo, "path": filename})
-            content = _extract_content_from_result(result)
-            if content:
-                any_success = True
-                if "README" in filename:
-                    ctx["readme"] = content[:4000]
-                elif filename in ("AGENTS.md", "CLAUDE.md"):
-                    ctx["agent_instructions"] = ctx.get("agent_instructions", "") + "\n" + content[:2000]
-                elif "architecture" in filename.lower():
-                    ctx["architecture_summary"] = content[:4000]
-        except Exception as e:
-            # Log but continue - optional files may not exist
+            args = _build_tree_tool_args(tree_tool, owner, repo)
+            result = mcp_client.call_tool(tree_tool.name, args)
+            tree = _extract_content_from_result(result)
+            if tree:
+                if isinstance(tree, list):
+                    ctx["tree_summary"] = tree[:200]
+                elif isinstance(tree, dict) and "tree" in tree:
+                    ctx["tree_summary"] = [
+                        f"{t.get('path', '')}/" if t.get("type") == "tree"
+                        else t.get("path", "")
+                        for t in tree.get("tree", [])
+                    ][:200]
+                elif isinstance(tree, str):
+                    ctx["tree_summary"] = [
+                        line.strip() for line in tree.splitlines() if line.strip()
+                    ][:200]
+        except Exception:
             pass
-    
-    # Try to get tree listing
-    try:
-        result = mcp_client.call_tool(tool.name, {"owner": owner, "repo": repo, "path": ""})
-        tree = _extract_content_from_result(result)
-        if tree:
-            if isinstance(tree, list):
-                ctx["tree_summary"] = tree[:200]
-            elif isinstance(tree, dict) and "tree" in tree:
-                ctx["tree_summary"] = [f"{t.get('path', '')}/" if t.get("type") == "tree" else t.get("path", "") for t in tree.get("tree", [])][:200]
-    except Exception:
-        pass
-    
+
     # If no content could be fetched at all and this is a required repo, fail
-    if not any_success:
+    if not any_success and "tree_summary" not in ctx:
         ctx["repo_required"] = True
         ctx["access_error"] = "No repository content accessible via MCP Gateway"
-    
+
     return ctx
+
+
+# ── Tool selection by contract ────────────────────────────────────────────
+
+# Explicitly preferred names — first wins. These are tools whose name
+# (and ideally description + input schema) describe reading a single
+# file's content from a remote repository.
+_PREFERRED_FILE_TOOL_NAMES = (
+    "get_file_contents",
+    "fetch_file",
+    "read_repository_file",
+    "get_repository_file",
+    "read_file",
+    "get_file_content",
+    "get_file",
+)
+# Explicitly preferred names — first wins. These are tools that list
+# repository trees (root or path) WITHOUT returning file content.
+_PREFERRED_TREE_TOOL_NAMES = (
+    "list_files",
+    "get_file_tree",
+    "list_repository_files",
+    "get_tree",
+    "list_directory",
+    "list_repo_files",
+)
+
+
+def _tool_name(tool) -> str:
+    """Best-effort tool name extraction (object attribute or dict key)."""
+    name = _get(tool, "name", "")
+    return (name or "").lower() if isinstance(name, str) else ""
+
+
+def _tool_description(tool) -> str:
+    """Best-effort tool description extraction."""
+    desc = _get(tool, "description", "")
+    return (desc or "").lower() if isinstance(desc, str) else ""
+
+
+def _tool_input_schema(tool) -> dict:
+    """Best-effort tool input_schema extraction."""
+    schema = _get(tool, "input_schema", None) or _get(tool, "inputSchema", None)
+    return schema if isinstance(schema, dict) else {}
+
+
+def _schema_has_path_param(tool) -> bool:
+    """True iff the tool's input schema requires or accepts ``path``."""
+    schema = _tool_input_schema(tool)
+    if not schema:
+        # No schema advertised — we must NOT assume it accepts ``path``.
+        return False
+    props = schema.get("properties", {})
+    return "path" in props
+
+
+def _schema_required_keys(tool) -> set[str]:
+    schema = _tool_input_schema(tool)
+    req = schema.get("required", []) if schema else []
+    return set(req) if isinstance(req, list) else set()
+
+
+def _select_file_content_tool(tools) -> object | None:
+    """Pick the best file-content tool from the discovered MCP tools.
+
+    Selection contract:
+      * Prefer explicitly named tools (in our preferred list).
+      * Otherwise pick a tool whose name OR description strongly
+        suggests file-content reading AND (whose input schema accepts
+        a ``path`` parameter OR the tool's name carries a clear
+        file-content signal like ``file_contents``).
+      * NEVER pick a tool just because its name contains ``github``
+        (``github.search`` is the canonical failure mode — it's the
+        first ``github``-* tool returned but it does not read
+        file content).
+      * Skip tools whose name or description mentions ``search`` or
+        ``tree`` or ``list`` — they are file-content tools' opposites.
+    """
+    if not tools:
+        return None
+
+    # 1. Explicit-preferred-name match wins (exact or name ends with
+    #    one of the preferred names — handles ``github_get_file_contents``
+    #    style prefixes whilst still preferring a contracted tool).
+    for preferred in _PREFERRED_FILE_TOOL_NAMES:
+        for t in tools:
+            name = _tool_name(t)
+            if name == preferred or name.endswith("_" + preferred) or name.endswith("." + preferred):
+                return t
+
+    # 2. Contract match: name OR description suggests file content
+    #    AND (input schema accepts a ``path`` parameter OR name carries
+    #    a strong file-content signal) AND tool is NOT a search/tree/list
+    #    tool.
+    candidates = []
+    for t in tools:
+        name = _tool_name(t)
+        desc = _tool_description(t)
+        # Reject search/list/tree tools explicitly.
+        if any(kw in name for kw in ("search", "list", "tree", "glob", "grep", "find")):
+            continue
+        if any(kw in desc for kw in ("search", "list files", "list repo", "directory tree", "directory listing")):
+            continue
+        # Require EITHER a path argument in the schema OR a strong name
+        # signal like ``file_contents`` / ``get_file`` so legacy MCP
+        # gateways that don't advertise input schemas still get picked.
+        strong_name_signal = any(kw in name for kw in (
+            "file_contents", "file_content", "get_file", "read_file",
+            "fetch_file", "file_blob", "blob",))
+        if not (_schema_has_path_param(t) or strong_name_signal):
+            continue
+        # Strong signal: name suggests file content reading.
+        name_signals = any(kw in name for kw in ("file", "content", "read", "fetch", "blob"))
+        desc_signals = any(kw in desc for kw in (
+            "file content", "read file", "fetch file", "blob", "read repository", "file contents"))
+        if name_signals or desc_signals:
+            candidates.append(t)
+    if candidates:
+        return candidates[0]
+    return None
+
+
+def _select_tree_listing_tool(tools) -> object | None:
+    """Pick the best tree/listing tool from the discovered MCP tools.
+
+    Selection contract:
+      * Prefer explicitly named tools (in our preferred list).
+      * Otherwise pick a tool whose name OR description suggests
+        tree/listing AND whose input schema does NOT require ``path``
+        (a listing tool should never mandate a single file path).
+      * Skip tools whose name mentions ``search`` — search is not
+        listing.
+    """
+    if not tools:
+        return None
+
+    # 1. Explicit-preferred-name match wins. Allow ``github_`` /
+    #    ``github.`` prefixed forms so prefixed MCP gateways still
+    #    satisfy the contracted preference.
+    for preferred in _PREFERRED_TREE_TOOL_NAMES:
+        for t in tools:
+            name = _tool_name(t)
+            if name == preferred or name.endswith("_" + preferred) or name.endswith("." + preferred):
+                return t
+
+    # 2. Contract match: name OR description suggests listing and the
+    #    schema does NOT require``path``.
+    candidates = []
+    for t in tools:
+        name = _tool_name(t)
+        desc = _tool_description(t)
+        if "search" in name:
+            continue
+        required_keys = _schema_required_keys(t)
+        if "path" in required_keys:
+            # A listing tool that requires a single path is suspect.
+            continue
+        name_signals = any(kw in name for kw in ("list", "tree", "directory", "glob"))
+        desc_signals = any(kw in desc for kw in (
+            "list files", "directory tree", "directory listing", "list of files",
+            "tree of", "repository tree", "list repository"))
+        if name_signals or desc_signals:
+            candidates.append(t)
+    if candidates:
+        return candidates[0]
+    return None
+
+
+def _build_file_tool_args(tool, owner: str, repo: str, path: str) -> dict:
+    """Build the call_tool argument dict for a file-content tool.
+
+    Honors the tool's input schema — only includes keys that the schema
+    declares.  Falls back to ``owner``/``repo``/``path`` if the schema
+    is unavailable (older MCP gateways).
+    """
+    schema = _tool_input_schema(tool)
+    if not schema:
+        return {"owner": owner, "repo": repo, "path": path}
+    props = schema.get("properties", {})
+    args: dict = {}
+    for key, source in (("owner", owner), ("repo", repo), ("path", path),
+                        ("repository", repo), ("file_path", path),
+                        ("filepath", path)):
+        if key in props:
+            args[key] = source
+    return args
+
+
+def _build_tree_tool_args(tool, owner: str, repo: str) -> dict:
+    """Build the call_tool argument dict for a tree-listing tool."""
+    schema = _tool_input_schema(tool)
+    if not schema:
+        return {"owner": owner, "repo": repo}
+    props = schema.get("properties", {})
+    args: dict = {}
+    for key, source in (("owner", owner), ("repo", repo),
+                        ("repository", repo)):
+        if key in props:
+            args[key] = source
+    return args
 
 
 def _extract_owner(repo_url: str) -> str:

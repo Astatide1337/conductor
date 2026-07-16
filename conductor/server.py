@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 
 from conductor import VERSION
 from conductor.auth import AuthHandler, _make_auth_middleware_cls, make_mcp_auth_middleware_cls
-from conductor.config import ConductorConfig
+from conductor.config import ConductorConfig, load_config
 from conductor.events import emit, list_events as list_events_fn
 from conductor.logging import (
     bind_request_context,
@@ -177,6 +177,13 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
     skills_client = _build_skills_client(cfg)
     mcp_gw_client = _build_mcp_gateway_client(cfg)
     gw_registry = build_default_registry(cfg)
+    # Build the wiki-mcp client from configuration — never ``None`` so
+    # composer never has to guard against a null reference at every call.
+    from conductor.clients.wiki_mcp import build_wiki_mcp_client, NullWikiMcpClient
+    wiki_client = build_wiki_mcp_client(cfg.wiki_mcp)
+    if not isinstance(wiki_client, NullWikiMcpClient):
+        logger.info("Wiki MCP client configured: url=%s auth_mode=%s",
+                    cfg.wiki_mcp.url, cfg.wiki_mcp.auth_mode)
 
     # ── Composer setup (before MCP so tools can reference it) ────────────
     app_state_composer = None
@@ -213,7 +220,7 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
             agents_gateway_client=gw_client,
             config=cfg.composer,
             skills_gateway_client=skills_client,
-            wiki_mcp_client=None,
+            wiki_mcp_client=wiki_client,
             mcp_gateway_client=mcp_gw_client,
             gateway_registry=gw_registry,
             metrics=metrics_reg,
@@ -296,7 +303,13 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "service": "astatide-conductor"}
+        result: dict = {"status": "ok", "service": "astatide-conductor"}
+        composer = getattr(app.state, "composer", None)
+        if composer is not None:
+            from conductor.composer.llm import FakeComposerLLMClient
+            result["composer_llm_provider"] = "fake" if isinstance(composer.llm, FakeComposerLLMClient) else "http"
+            result["composer_llm_model"] = getattr(composer.llm, "model", "") or getattr(composer.config, "llm_model", "")
+        return result
 
     @app.get("/ready")
     async def ready():
@@ -814,6 +827,29 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
             raise HTTPException(503, "Composer not enabled")
         return await composer.steer_objective(objective_id, body.guidance)
 
+    @app.post("/composer/objectives/{objective_id}/dev/force-complete")
+    async def composer_dev_force_complete(objective_id: str, request: Request):
+        """DEV-ONLY: drive mock gateway tasks through completion,
+        verification, integration, report generation, and objective
+        completion. Used by ``scripts/e2e-composer-local.sh``.
+
+        Disabled when the server is running in production
+        (``cfg.environment == "production"``) or when a non-mock
+        Agents Gateway client is configured.
+        """
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        # Double gate — the ComposerService.force_completion method
+        # also refuses to run when the configured env is not test/dev
+        # or when the downstream agents gateway is not a mock client.
+        result = await composer.force_completion(objective_id)
+        if isinstance(result, dict) and result.get("error"):
+            # Surface a 403 for disallowed attempts — never allow
+            # production to silently no-op.
+            raise HTTPException(403, result["error"])
+        return result
+
     # ── MCP server mount ────────────────────────────────────────────────
     # The MCP sub-app was built earlier in create_app so its lifespan could
     # be propagated to the parent FastAPI app (FastMCP requires this for
@@ -831,10 +867,18 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
 
 def run_server(cfg: ConductorConfig) -> None:
     setup_logging(cfg.observability.log_level, cfg.observability.log_format)
-    logger.info("boot env=%s auth=%s port=%s", cfg.environment, cfg.auth.mode, cfg.service.port)
+    logger.info("boot env=%s auth=%s port=%s", cfg.environment, cfg.auth.mode, cfg.service.port, extra={"composer_enabled": cfg.composer.enabled, "composer_test_mode": cfg.composer.test_mode})
 
     app = create_app(cfg)
 
     cfg.auth.mode = cfg.auth.mode  # suppress unused warning — auth is wired in create_app
 
     uvicorn.run(app, host=cfg.service.host, port=cfg.service.port, log_level=cfg.observability.log_level.lower())
+
+
+if __name__ == "__main__":
+    # ``python -m conductor.server`` boots with the configured env vars
+    # (CONDUCTOR_ENVIRONMENT, CONDUCTOR_COMPOSER_TEST_MODE, etc.) without
+    # needing the CLI/Typer entrypoint — useful for dev/E2E runs.
+    _cfg = load_config()
+    run_server(_cfg)

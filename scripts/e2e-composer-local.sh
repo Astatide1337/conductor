@@ -23,7 +23,7 @@ check_contains() {
         echo "  PASS: ${label}"
         PASS=$((PASS + 1))
     else
-        echo "  FAIL: ${label} (expected '${pattern}' in text)"
+        echo "  FAIL: ${label} (expected pattern '${pattern}' in '${text}')"
         FAIL=$((FAIL + 1))
     fi
 }
@@ -31,12 +31,38 @@ check_contains() {
 echo "=== Composer Local E2E ==="
 echo ""
 
-# 1. Health
-echo "--- Health ---"
-R=$(curl -sf "${BASE}/health")
-check "health ok" "ok" "$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")"
+# 0. Pre-flight: confirm the server is the dev-image with test_mode
+# enabled *before* we submit anything. The dev/force-complete endpoint
+# refuses to run on production-grade deployments, so the local E2E
+# itself refuses to start without it.
+echo "--- Pre-flight: composer test_mode ---"
+R=$(curl -sf "${BASE}/health" 2>/dev/null || echo '{"status":"unreachable"}')
+HEALTH_STATUS=$(echo "$R" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('status', 'missing'))
+except Exception:
+    print('parse_failure')
+")
+check "health ok" "ok" "${HEALTH_STATUS}"
+COMPOSER_PROVIDER=$(echo "$R" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    # Health exposes the composer's LLM provider diagnostic. When
+    # test_mode is enabled we MUST see 'fake' — never 'http' in local E2E.
+    print(d.get('composer_llm_provider', 'missing'))
+except Exception:
+    print('parse_failure')
+")
+if [[ "$COMPOSER_PROVIDER" == "missing" || "$COMPOSER_PROVIDER" == "parse_failure" ]]; then
+    echo "  WARN: composer_llm_provider not exposed; pre-flight check skips"
+else
+    check_contains "composer test_mode active" "fake" "$COMPOSER_PROVIDER"
+fi
 
-# 2. Submit Composer spec async (returns immediately with status "received")
+# 1. Submit Composer spec async (returns immediately with status "received")
 echo "--- Submit Spec (async) ---"
 R=$(curl -sf -X POST "${BASE}/composer/objectives" -H "Content-Type: application/json" -d '{
   "title":"Local E2E Calculator",
@@ -46,11 +72,10 @@ R=$(curl -sf -X POST "${BASE}/composer/objectives" -H "Content-Type: application
 }')
 OBJ_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['objective_id'])")
 SPEC_ID=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['composer_spec_id'])")
-check "spec submitted" "received" "$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")"
 echo "  objective_id=${OBJ_ID}"
 echo "  composer_spec_id=${SPEC_ID}"
 
-# 3. Verify repository + base_branch persisted
+# 2. Repository + base_branch preservation
 echo "--- Repository Preservation ---"
 R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/spec")
 REPO_URL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('repository_url',''))")
@@ -58,10 +83,10 @@ BRANCH=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get
 check "repository url preserved" "https://github.com/test/local-calc.git" "${REPO_URL}"
 check "base_branch preserved" "develop" "${BRANCH}"
 
-# 4. Wait for async supervisor to advance spec through stages
+# 3. Wait for the spec to advance from "received" — supervisor tick.
 echo "--- Supervisor advances spec ---"
-# Poll up to 30 seconds for the spec to advance from received
 ADVANCED=0
+SPEC_STATUS=""
 for _ in $(seq 1 15); do
     sleep 2
     R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/spec")
@@ -77,65 +102,153 @@ if [ "$ADVANCED" -eq 1 ]; then
     echo "  PASS: spec advanced from received (status: ${SPEC_STATUS})"
     PASS=$((PASS + 1))
 else
-    echo "  FAIL: spec advanced from received (expected normalized|planning|planned|executing, got ${SPEC_STATUS})"
+    echo "  FAIL: spec did not advance from received (expected normalized|planning|planned|executing, got ${SPEC_STATUS})"
     FAIL=$((FAIL + 1))
 fi
 
-# 5. Plan generated
+# 4. Plan generated — multiple plan tasks required.
 echo "--- Plan ---"
 R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/plan")
 PLAN_STATUS=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))")
-check_contains "plan active" "active\|integrating\|completed" "${PLAN_STATUS}"
 TASK_COUNT=$(echo "$R" | python3 -c "
 import sys,json
 plan = json.load(sys.stdin)
-tasks = plan.get('plan_tasks', [])
-print(len(tasks))
+print(len(plan.get('plan_tasks', [])))
 ")
+echo "  plan status: ${PLAN_STATUS}"
 echo "  plan tasks: ${TASK_COUNT}"
+check_contains "plan active" "active\|integrating\|completed" "${PLAN_STATUS}"
 check_contains "at least 3 tasks" "2\|3\|4\|5\|6" "${TASK_COUNT}"
 
-# 6. Tasks dispatched (at least 2 separate gw tasks)
+# 5. Tasks dispatched (supervisor ran dispatch_ready_tasks at least once)
 echo "--- Tasks ---"
 R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/tasks")
-TASKS_JSON="$R"
-DISPATCHED=$(echo "$TASKS_JSON" | python3 -c "
+DISPATCHED=$(echo "$R" | python3 -c "
 import sys,json
 data = json.load(sys.stdin)
 tasks = data.get('tasks', [])
 print(len([t for t in tasks if t.get('status') in ('dispatching','running','completed','verifying')]))
 ")
+echo "  dispatched tasks: ${DISPATCHED}"
 check_contains "tasks dispatched" "1\|2\|3\|4\|5" "${DISPATCHED}"
 
-# 7. Timeline has events
+# 6. Timeline has events
 echo "--- Timeline ---"
 R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/timeline")
 EVENT_COUNT=$(echo "$R" | python3 -c "
 import sys,json
 data = json.load(sys.stdin)
-events = data.get('events',[])
-print(len(events))
+print(len(data.get('events',[])))
 ")
+echo "  events: ${EVENT_COUNT}"
 check_contains "timeline has events" "1\|2\|3\|4\|5\|6\|7\|8\|9" "${EVENT_COUNT}"
 
-# 8. Reconcile (advances execution — sets executed task completions in mock)
-echo "--- Reconcile ---"
-R=$(curl -sf -X POST "${BASE}/composer/objectives/${OBJ_ID}/reconcile")
-ACTIONS=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('actions',[])))")
-echo "  reconcile actions: ${ACTIONS}"
+# 7. ⭐ DETERMINISTIC COMPLETION DRIVE — the local E2E proof.
+# Drive the mock-gateway tasks through completion, verification, and
+# integration, then trigger objective completion + final report.
+echo "--- Force completion (dev) ---"
+R=$(curl -sf -X POST "${BASE}/composer/objectives/${OBJ_ID}/dev/force-complete" 2>/dev/null || echo '{"error":"unreachable"}')
+DRIVE_ERROR=$(echo "$R" | python3 -c "
+import sys,json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('error', '') or '')
+except Exception:
+    print('parse_failure')
+")
+if [[ -n "$DRIVE_ERROR" ]]; then
+    echo "  FAIL: /dev/force-complete refused: ${DRIVE_ERROR}"
+    echo "       (this means the server is NOT in test/dev mode — local E2E"
+    echo "        cannot drive deterministic completion in production)"
+    FAIL=$((FAIL + 1))
+else
+    FINAL_STATUS=$(echo "$R" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+print(d.get('final_status', 'missing'))
+")
+    ACTIONS_COUNT=$(echo "$R" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+print(len(d.get('actions', [])))
+")
+    echo "  drive actions: ${ACTIONS_COUNT}"
+    check "objective completed" "completed" "${FINAL_STATUS}"
+fi
 
-# 9. Objective visible
-echo "--- Get Objective ---"
-R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}")
-OBJ_OK=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if (d.get('id') or d.get('objective_id')) else 'missing')")
-check "objective found" "ok" "${OBJ_OK}"
+# 8. Spec status check — the persisted spec.status MUST now read 'completed'.
+echo "--- Spec Final Status ---"
+R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/spec")
+SPEC_STATUS_FINAL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))")
+check "spec status completed" "completed" "${SPEC_STATUS_FINAL}"
 
-# 10. Report may be generated once mock tasks reach 'completed'
-echo "--- Get Report ---"
-R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/report" 2>/dev/null || echo '{"error":"not found"}')
-REPORT_STATUS=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','') or d.get('error',''))")
-echo "  report: ${REPORT_STATUS}"
-# Not required to be completed — mock gateway doesn't advance tasks autonomously
+# 9. Plan status — the persisted plan.status MUST now read 'completed'.
+echo "--- Plan Final Status ---"
+R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/plan")
+PLAN_STATUS_FINAL=$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))")
+check "plan status completed" "completed" "${PLAN_STATUS_FINAL}"
+
+# 10. Final integration branch + commit SHA — the integration task
+# (node_key="integration") MUST have both branch and commit_sha set
+# in its persisted plan_task dict.
+echo "--- Integration Task Evidence ---"
+R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/plan")
+INTEGRATION_EVIDENCE=$(echo "$R" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+impl_tasks = [t for t in d.get('plan_tasks', []) if t.get('node_key') == 'integration']
+if not impl_tasks:
+    print('MISSING')
+else:
+    t = impl_tasks[0]
+    b = t.get('branch', '') or ''
+    c = t.get('commit_sha', '') or ''
+    if b and c:
+        print(f'{b}+{c}')
+    else:
+        print(f'MISSING_BRANCH_OR_COMMIT ({b})({c})')
+")
+check_contains "integration task recorded branch + commit" "integration/main+intsha" "${INTEGRATION_EVIDENCE}"
+
+# 11. ⭐ Final report — the objective's report MUST exist and report
+# the completed objective. REQUIRED (no longer optional).
+echo "--- Final Report (required) ---"
+R=$(curl -sf "${BASE}/composer/objectives/${OBJ_ID}/report")
+REPORT_STATUS=$(echo "$R" | python3 -c "
+import sys,json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('status', 'missing'))
+except Exception:
+    print('missing')
+")
+check "report exists and status=completed" "completed" "${REPORT_STATUS}"
+REPORT_ID=$(echo "$R" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+print(d.get('id', '') or d.get('report_id', '') or '')
+")
+if [[ -n "$REPORT_ID" ]]; then
+    echo "  report id: ${REPORT_ID}"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: report missing id"
+    FAIL=$((FAIL + 1))
+fi
+
+# 12. Top-level conductor objective status — confirm "completed" through
+# the conductor's own /objectives/{id} endpoint as well, not just Composer's
+# spec status.
+echo "--- Conductor Objective Final ---"
+R=$(curl -sf "${BASE}/objectives/${OBJ_ID}")
+CONDUCTOR_STATUS=$(echo "$R" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+obj = d.get('objective', d)
+print(obj.get('status', 'missing'))
+")
+echo "  conductor objective status: ${CONDUCTOR_STATUS}"
+check_contains "conductor objective completed" "completed" "${CONDUCTOR_STATUS}"
 
 echo ""
 echo "=== Composer Local E2E Complete ==="

@@ -168,6 +168,7 @@ def _env_overrides() -> dict:
         "composer_llm_model": ("composer", "llm_model"),
         "composer_llm_timeout_seconds": ("composer", "llm_timeout_seconds"),
         "composer_enabled": ("composer", "enabled"),
+        "composer_test_mode": ("composer", "test_mode"),
         "composer_max_parallel_tasks": ("composer", "max_parallel_tasks"),
         "composer_max_repair_retries": ("composer", "max_repair_retries"),
         "composer_poll_interval_seconds": ("composer", "poll_interval_seconds"),

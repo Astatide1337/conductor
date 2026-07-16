@@ -172,6 +172,11 @@ class VerificationContract:
                     "command": cmd.get("command", "") if isinstance(cmd, dict) else "",
                     "passed": cmd.get("passed", False) if isinstance(cmd, dict) else False,
                     "required": cmd.get("required", False) if isinstance(cmd, dict) else False,
+                    "exit_code": cmd.get("exit_code") if isinstance(cmd, dict) else None,
+                    "blocked": cmd.get("blocked", False) if isinstance(cmd, dict) else False,
+                    "blocked_reason": cmd.get("blocked_reason", "") if isinstance(cmd, dict) else "",
+                    "output_artifact": cmd.get("output_artifact", "") if isinstance(cmd, dict) else "",
+                    "duration_seconds": cmd.get("duration_seconds") if isinstance(cmd, dict) else None,
                 })
 
             # Every expected required command must exist and pass.
@@ -209,6 +214,17 @@ class VerificationContract:
                         f"missing for {pt.get('node_key', '')}"
                     )
                     continue
+
+                # Use blocked/blocked_reason directly to infer blocker type
+                if actual.get("blocked", False):
+                    return ObjectiveCompletion(
+                        complete=False, blocked_external=True, failed=False,
+                        reasons=[f"Required verification '{exp_name or exp_command}' "
+                                 f"blocked for {pt.get('node_key', '')}: "
+                                 f"{actual.get('blocked_reason', '')}"],
+                        verification_evidence=evidence,
+                    )
+
                 # IGNORE actual.get("required") — plan is the authority.
                 if not actual.get("passed", False):
                     reasons.append(
@@ -224,17 +240,15 @@ class VerificationContract:
                 for ev in evidence:
                     if ev["node_key"] == pt.get("node_key", "") and ev["name"] == live_e2e.get("name", ""):
                         matched = True
+                        # Check blocked directly before checking passed
+                        if ev.get("blocked", False):
+                            return ObjectiveCompletion(
+                                complete=False, blocked_external=True, failed=False,
+                                reasons=[f"Required live E2E '{live_e2e.get('name')}' blocked: "
+                                         f"{ev.get('blocked_reason', '')}"],
+                                verification_evidence=evidence,
+                            )
                         if not ev.get("passed", False):
-                            # Check if it's a credentials/service issue (blocked_external)
-                            # Heuristic: if output contains "credential" or "auth" or "unauthorized"
-                            cmd_output = ev.get("command", "").lower()
-                            if any(k in cmd_output for k in ("credential", "auth", "unauthorized", "permission", "401", "403")):
-                                return ObjectiveCompletion(
-                                    complete=False, blocked_external=True, failed=False,
-                                    reasons=[f"Required live E2E '{live_e2e.get('name')}' blocked by credentials/service"],
-                                    verification_evidence=evidence,
-                                )
-                            # Otherwise it's a test failure — objective remains uncompleted, repair continues
                             reasons.append(f"Required live E2E '{live_e2e.get('name')}' failed")
                         break
                 if not matched:

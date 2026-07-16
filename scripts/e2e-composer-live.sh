@@ -4,19 +4,28 @@
 #
 # Proves 12 things:
 #   1. real repository accessible to Agents Gateway
-#   2. real Composer LLM used
+#   2. real Composer LLM used (provider != fake)
 #   3. at least two real harness tasks
 #   4. unique task worktree paths and branches
-#   5. source files actually changed
-#   6. required task verification records passed
+#   5. source files actually changed in the FINAL integration checkout
+#   6. required task verification records passed via real GW endpoints
 #   7. integration task completed
-#   8. integration verification passed
+#   8. integration verification passed via real GW endpoint
 #   9. final branch and commit SHA recovered from real evidence
 #  10. HTML and JSON reports generated
 #  11. reports contain verification and artifact evidence
 #  12. objective completed
 #
 # Initial repo contains ONLY add(a,b) — multiply/divide are produced by the Composer pipeline.
+#
+# Final-checkout flow:
+#   - clone the repository into a verification directory
+#   - fetch the final integration branch
+#   - checkout that branch
+#   - verify HEAD equals the reported final commit SHA
+#   - import multiply and divide from that checkout
+#   - run uv run pytest -q in that checkout
+#   - keep the checkout until all assertions finish
 set -euo pipefail
 
 # ── Required environment ───────────────────────────────────────────────────
@@ -43,12 +52,39 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
     exit 2
 fi
 
+# ── Require an Agents-Gateway-accessible repository ──────────────────────
+# Use file:// only when COMPOSER_LIVE_SHARED_VOLUME=true.
+# Otherwise require COMPOSER_LIVE_REPO_URL.
+REPO_URL="${COMPOSER_LIVE_REPO_URL:-}"
+if [[ -z "${REPO_URL}" ]]; then
+    if [[ "${COMPOSER_LIVE_SHARED_VOLUME:-}" == "true" ]]; then
+        REPO_URL="file://${COMPOSER_LIVE_REPO_DIR:-/tmp/composer-live-repo}"
+    else
+        echo "COMPOSER LIVE E2E BLOCKED: missing COMPOSER_LIVE_REPO_URL"
+        exit 2
+    fi
+fi
+
+# ── Prove the real LLM client is active ───────────────────────────────────
+# Require production environment and test_mode=false for the live test.
+if [[ "${CONDUCTOR_ENVIRONMENT:-}" != "production" ]]; then
+    echo "COMPOSER LIVE E2E BLOCKED: CONDUCTOR_ENVIRONMENT must be 'production' (got '${CONDUCTOR_ENVIRONMENT:-}')"
+    exit 2
+fi
+if [[ "${CONDUCTOR_COMPOSER__TEST_MODE:-${CONDUCTOR_COMPOSER_TEST_MODE:-}}" == "true" ]]; then
+    echo "COMPOSER LIVE E2E BLOCKED: CONDUCTOR_COMPOSER__TEST_MODE must be 'false' for live E2E"
+    exit 2
+fi
+
 BASE="${CONDUCTOR_BASE_URL}"
 AUTH_HEADER="X-Auth-Internal-Token: ${CONDUCTOR_INTERNAL_TOKEN}"
+GW_BASE="${CONDUCTOR_AGENTS_GATEWAY_URL}"
+GW_AUTH="X-Auth-Internal-Token: ${CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN}"
 TIMEOUT_SEC="${COMPOSER_LIVE_TIMEOUT_SEC:-600}"
 PASS=0
 FAIL=0
 STAGE=""
+VERIFY_DIR=""
 
 check() {
     local label="$1" expected="$2" got="$3"
@@ -72,12 +108,19 @@ check_contains() {
     fi
 }
 
+cleanup() {
+    if [[ -n "${VERIFY_DIR}" && -d "${VERIFY_DIR}" ]]; then
+        rm -rf "${VERIFY_DIR}"
+    fi
+}
+trap cleanup EXIT
+
 poll_until() {
     local desc="$1" max_sec="$2" url="$3" extract_py="$4" expected="$5"
     STAGE="${desc}"
     local waited=0
+    local R val
     while [[ $waited -lt $max_sec ]]; do
-        local R val
         R=$(curl -sf -H "${AUTH_HEADER}" "${url}" 2>/dev/null || echo '{"error":"curl failed"}')
         val=$(echo "$R" | python3 -c "${extract_py}" 2>/dev/null || echo '')
         if echo "$val" | grep -q "${expected}"; then
@@ -98,35 +141,37 @@ echo "=== Composer Live E2E ==="
 echo ""
 echo "Conductor: ${BASE}"
 echo "LLM model: ${CONDUCTOR_COMPOSER_LLM_MODEL}"
-echo "Agents Gateway: ${CONDUCTOR_AGENTS_GATEWAY_URL}"
+echo "Agents Gateway: ${GW_BASE}"
 echo "Timeout: ${TIMEOUT_SEC}s"
 echo ""
 
-# ── 0. Create disposable repo with ONLY add(a, b) ─────────────────────────
+# ── 0. Setup repo (local test repo if file://, otherwise use provided URL) ─
 STAGE="setup repo"
 echo "--- Setup Repository (add-only) ---"
 REPO_DIR="${COMPOSER_LIVE_REPO_DIR:-/tmp/composer-live-repo-$(date +%s)}"
-if [[ ! -d "${REPO_DIR}/.git" ]]; then
-    mkdir -p "${REPO_DIR}/calculator"
-    cd "${REPO_DIR}"
-    git init
-    git config user.email "composer@e2e.test"
-    git config user.name "Composer Live E2E"
-    echo '# Disposable live test repo' > README.md
-    cat > calculator/__init__.py <<'EOF'
+if [[ "${REPO_URL}" == file://* ]]; then
+    REPO_DIR="${REPO_URL#file://}"
+    if [[ ! -d "${REPO_DIR}/.git" ]]; then
+        mkdir -p "${REPO_DIR}/calculator"
+        cd "${REPO_DIR}"
+        git init
+        git config user.email "composer@e2e.test"
+        git config user.name "Composer Live E2E"
+        echo '# Disposable live test repo' > README.md
+        cat > calculator/__init__.py <<'EOF'
 """Simple calculator package for E2E testing."""
 
 def add(a: int, b: int) -> int:
     return a + b
 EOF
-    cat > calculator/test_calculator.py <<'EOF'
+        cat > calculator/test_calculator.py <<'EOF'
 from calculator import add
 
 def test_add():
     assert add(2, 3) == 5
     assert add(0, 0) == 0
 EOF
-    cat > pyproject.toml <<'EOF'
+        cat > pyproject.toml <<'EOF'
 [project]
 name = "calculator"
 version = "0.1.0"
@@ -139,23 +184,46 @@ build-backend = "setuptools.build_meta"
 minversion = "7.0"
 testpaths = ["calculator"]
 EOF
-    git add .
-    git commit -m "Initial: add-only calculator"
-    cd -
+        git add .
+        git commit -m "Initial: add-only calculator"
+        cd -
+    fi
 fi
-echo "  Repo: ${REPO_DIR}"
+echo "  Repo URL: ${REPO_URL}"
+echo "  Repo dir: ${REPO_DIR}"
 
-# Verify the initial repo only has add
-INITIAL_ADD=$(cd "${REPO_DIR}" && python3 -c "from calculator import add; print(add(1,2))" 2>/dev/null || echo "err")
-check "initial add works" "3" "${INITIAL_ADD}"
-INITIAL_MULTI=$(cd "${REPO_DIR}" && python3 -c "from calculator import multiply; print('yes')" 2>/dev/null || echo "no")
-check "no multiply yet" "no" "${INITIAL_MULTI}"
+if [[ "${REPO_URL}" == file://* ]]; then
+    INITIAL_ADD=$(cd "${REPO_DIR}" && python3 -c "from calculator import add; print(add(1,2))" 2>/dev/null || echo "err")
+    check "initial add works" "3" "${INITIAL_ADD}"
+    INITIAL_MULTI=$(cd "${REPO_DIR}" && python3 -c "from calculator import multiply; print('yes')" 2>/dev/null || echo "no")
+    check "no multiply yet" "no" "${INITIAL_MULTI}"
+fi
 
 # ── 1. Health ─────────────────────────────────────────────────────────────
 STAGE="health"
 echo "--- Health ---"
 R=$(curl -sf "${BASE}/health")
 check "health ok" "ok" "$(echo "$R" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")"
+
+# ── 1b. Verify real LLM provider is active ────────────────────────────────
+STAGE="llm provider check"
+echo "--- LLM Provider ---"
+R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/health")
+LLM_PROVIDER=$(echo "$R" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+# composer_llm_provider may be at top level or in composer section
+p = d.get('composer_llm_provider', '') or d.get('composer', {}).get('llm_provider', '')
+print(p)
+" 2>/dev/null || echo "")
+check_contains "llm provider is http (not fake)" "^http$" "${LLM_PROVIDER}"
+LLM_MODEL_DIAG=$(echo "$R" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+m = d.get('composer_llm_model', '') or d.get('composer', {}).get('llm_model', '')
+print(m)
+" 2>/dev/null || echo "")
+check_contains "llm model reported" ".\{2\}" "${LLM_MODEL_DIAG}"
 
 # ── 2. Submit calculator spec — add multiply and divide ───────────────────
 STAGE="submit spec"
@@ -170,13 +238,10 @@ Requirements:
 - Run uv run pytest -q in the project root.
 - Produce an integration branch with all changes.'
 
-# Do not default to file:// — require an accessible repo URL
-REPO_URL="${COMPOSER_LIVE_REPO_URL:-}"
-if [[ -z "${REPO_URL}" || "${REPO_URL}" == file://* && "${COMPOSER_LIVE_SHARED_VOLUME:-}" != "true" ]]; then
-    echo "  NOTE: no COMPOSER_LIVE_REPO_URL set — using local file:// repo (shared-volume mode)"
-    REPO_URL="file://${REPO_DIR}"
+BRANCH_NAME="${COMPOSER_LIVE_REPO_BRANCH:-main}"
+if [[ "${REPO_URL}" == file://* && -d "${REPO_DIR}/.git" ]]; then
+    BRANCH_NAME=$(cd "${REPO_DIR}" && git rev-parse --abbrev-ref HEAD)
 fi
-BRANCH_NAME=$(cd "${REPO_DIR}" && git rev-parse --abbrev-ref HEAD)
 
 R=$(curl -sf -X POST "${BASE}/composer/objectives" \
     -H "Content-Type: application/json" \
@@ -219,7 +284,7 @@ poll_until "tasks dispatched" 180 "${BASE}/composer/objectives/${OBJ_ID}/tasks" 
     "import sys,json; d=json.load(sys.stdin); dispatched=[t for t in d.get('tasks',[]) if t.get('status') in ('dispatching','running','completed','verifying')]; print(len(dispatched))" \
     "2\|3\|4\|5"
 
-# ── 7. Unique task worktree paths and branches (assertion 1) ──────────────
+# ── 7. Unique task worktree paths and branches (assertion 4) ──────────────
 echo "--- Distinct Worktrees ---"
 R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/tasks")
 GW_IDS=$(echo "$R" | python3 -c "
@@ -264,60 +329,97 @@ poll_until "implementation tasks completed" $((TIMEOUT_SEC - 200)) "${BASE}/comp
     "import sys,json; tasks=json.load(sys.stdin).get('tasks',[]); ct=sum(1 for t in tasks if t.get('task_type')!='integration' and t.get('status')=='completed'); print(ct)" \
     "2\|3\|4\|5"
 
-# ── 9. Source files actually changed (assertion 2-3) ────────────────────────
-STAGE="verify source changes"
-echo "--- Source Files Changed ---"
-sleep 2
-HAS_MULTIPLY=$(cd "${REPO_DIR}" && python3 -c "from calculator import multiply; print('yes')" 2>/dev/null || echo "no")
-check "multiply function added (strict)" "yes" "${HAS_MULTIPLY}"
-echo "  multiply import result: ${HAS_MULTIPLY}"
-HAS_DIVIDE=$(cd "${REPO_DIR}" && python3 -c "from calculator import divide; print('yes')" 2>/dev/null || echo "no")
-check "divide function added (strict)" "yes" "${HAS_DIVIDE}"
-echo "  divide import result: ${HAS_DIVIDE}"
-
-# ── 10. Integration task completed (assertion 9-10) ────────────────────────
-poll_until "integration completed" $((TIMEOUT_SEC - 100)) "${BASE}/composer/objectives/${OBJ_ID}/tasks" \
-    "import sys,json; tasks=json.load(sys.stdin).get('tasks',[]); it=[t for t in tasks if t.get('task_type')=='integration' or t.get('node_key')=='integration']; print(it[0].get('status','') if it else 'none')" \
-    "completed"
-
-# ── 11. Integration verification passed (assertion 9) ─────────────────────────
-STAGE="check integration verification"
-echo "--- Integration Verification ---"
-R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/tasks")
-INTEG_VERIF=$(echo "$R" | python3 -c "
-import sys,json
-tasks = json.load(sys.stdin).get('tasks',[])
-it = [t for t in tasks if t.get('node_key')=='integration']
-if it:
-    v = it[0].get('verification', {})
-    print(v.get('status','') if isinstance(v,dict) else '')
-else:
-    print('none')
-")
-check "integration verification passed" "passed" "${INTEG_VERIF:-none}"
-
-# ── 12. Query real verification endpoints for every task (assertion 7-8) ────
+# ── 9. Query real verification endpoints for every implementation task ─────
 STAGE="check per-task verification"
-echo "--- Per-Task Verification Endpoints ---"
+echo "--- Per-Task Verification Endpoints (real GW) ---"
 R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/tasks")
-GW_BASE="${CONDUCTOR_AGENTS_GATEWAY_URL}"
-GW_AUTH="X-Auth-Internal-Token: ${CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN}"
-VERIF_PASSED_COUNT=$(echo "$R" | python3 -c "
-import sys, json, urllib.request
+VERIF_RESULT=$(echo "$R" | python3 -c "
+import sys, json, os, urllib.request
 tasks = json.load(sys.stdin).get('tasks', [])
+gw_base = os.environ.get('CONDUCTOR_AGENTS_GATEWAY_URL', '')
+gw_token = os.environ.get('CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN', '')
+headers = {}
+if gw_token:
+    headers['X-Auth-Internal-Token'] = gw_token
+
 passed_count = 0
+required_cmd_failures = 0
+integration_passed = False
+
 for t in tasks:
     gw_id = t.get('agents_gateway_task_id', '')
     if not gw_id:
         continue
-    verif = t.get('verification', {})
-    if isinstance(verif, dict) and verif.get('status') == 'passed':
-        passed_count += 1
-print(passed_count)
-")
-check_contains "at least 2 tasks with verification passed" "2\|3\|4\|5" "${VERIF_PASSED_COUNT}"
+    is_integration = (t.get('task_type') == 'integration' or t.get('node_key') == 'integration')
+    # Resolve real agent_run_id and call verification endpoint
+    try:
+        # First get the task session to find agent_run_id
+        req = urllib.request.Request(f'{gw_base}/tasks/{gw_id}/session', headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            session_data = json.loads(resp.read())
+            agent_run_id = session_data.get('agent_run_id', '')
+            if not agent_run_id:
+                agent_run_id = gw_id  # fallback
+        req = urllib.request.Request(f'{gw_base}/agent-runs/{agent_run_id}/verification', headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            verif = json.loads(resp.read())
+        status = verif.get('status', '')
+        commands = verif.get('commands', [])
+        if status == 'passed':
+            passed_count += 1
+        # Check every required command exists and passed
+        for cmd in commands:
+            if isinstance(cmd, dict) and cmd.get('required', False):
+                if not cmd.get('passed', False):
+                    required_cmd_failures += 1
+        if is_integration and status == 'passed':
+            integration_passed = True
+    except Exception as e:
+        pass
 
-# ── 13. Final branch and commit SHA recovered from real evidence (assertion 4-5) ──
+print(f'passed={passed_count} failures={required_cmd_failures} integration_passed={integration_passed}')
+" 2>/dev/null || echo "passed=0 failures=0 integration_passed=False")
+echo "  verification: ${VERIF_RESULT}"
+check_contains "at least 2 tasks with verification passed via real GW" "passed=2\|passed=3\|passed=4\|passed=5" "${VERIF_RESULT}"
+check_contains "0 required command failures" "^failures=0$" "${VERIF_RESULT}"
+
+# ── 10. Integration task completed ────────────────────────────────────────
+poll_until "integration completed" $((TIMEOUT_SEC - 100)) "${BASE}/composer/objectives/${OBJ_ID}/tasks" \
+    "import sys,json; tasks=json.load(sys.stdin).get('tasks',[]); it=[t for t in tasks if t.get('task_type')=='integration' or t.get('node_key')=='integration']; print(it[0].get('status','') if it else 'none')" \
+    "completed"
+
+# ── 11. Integration verification passed via real GW endpoint ───────────────
+STAGE="check integration verification"
+echo "--- Integration Verification (real GW) ---"
+R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/tasks")
+INTEG_VERIF=$(echo "$R" | python3 -c "
+import sys, json, os, urllib.request
+tasks = json.load(sys.stdin).get('tasks', [])
+gw_base = os.environ.get('CONDUCTOR_AGENTS_GATEWAY_URL', '')
+gw_token = os.environ.get('CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN', '')
+headers = {}
+if gw_token:
+    headers['X-Auth-Internal-Token'] = gw_token
+it = [t for t in tasks if t.get('node_key')=='integration']
+if not it:
+    print('none')
+else:
+    gw_id = it[0].get('agents_gateway_task_id', '')
+    try:
+        req = urllib.request.Request(f'{gw_base}/tasks/{gw_id}/session', headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            session_data = json.loads(resp.read())
+            agent_run_id = session_data.get('agent_run_id', '') or gw_id
+        req = urllib.request.Request(f'{gw_base}/agent-runs/{agent_run_id}/verification', headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            verif = json.loads(resp.read())
+        print(verif.get('status', ''))
+    except Exception as e:
+        print(f'error: {e}')
+" 2>/dev/null || echo "error")
+check "integration verification passed (real GW)" "passed" "${INTEG_VERIF}"
+
+# ── 12. Final branch and commit SHA recovered from real evidence ───────────
 STAGE="check branch/commit"
 echo "--- Final Branch & Commit ---"
 R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/report")
@@ -327,46 +429,65 @@ check_contains "final branch present" ".\{3\}" "${FINAL_BR}"
 check_contains "final commit sha present" ".\{3\}" "${FINAL_SH}"
 echo "  branch=${FINAL_BR}  commit=${FINAL_SH}"
 
-# ── 14. Clone/fetch the final integration branch (assertion 4-5) ──────────
-STAGE="verify final branch different from initial commit"
-echo "--- Clone & Fetch Final Integration Branch ---"
-FETCH_DIR="/tmp/composer-verify-$(date +%s)"
-git clone "${REPO_DIR}" "${FETCH_DIR}" 2>/dev/null || true
-if [[ -n "${FINAL_BR}" && -d "${FETCH_DIR}" ]]; then
-    cd "${FETCH_DIR}"
+# ── 13. Clone/fetch the final integration branch (proper final-checkout flow) ──
+STAGE="final checkout verification"
+echo "--- Final Checkout (clone, fetch, checkout, verify HEAD) ---"
+# Use a unique verification directory and keep it until all assertions finish
+VERIFY_DIR="/tmp/composer-verify-$(date +%s)"
+# Clone the repository (from the original URL, not a worktree copy)
+git clone "${REPO_URL}" "${VERIFY_DIR}" 2>/dev/null
+if [[ ! -d "${VERIFY_DIR}/.git" ]]; then
+    echo "  FAIL: clone failed for ${REPO_URL}"
+    FAIL=$((FAIL + 1))
+else
+    cd "${VERIFY_DIR}"
+    # Fetch the final integration branch
     git fetch origin "${FINAL_BR}" 2>/dev/null || git fetch origin 2>/dev/null || true
+    # Checkout that branch
     git checkout "${FINAL_BR}" 2>/dev/null || git checkout "origin/${FINAL_BR}" 2>/dev/null || true
-    FINAL_INITIAL=$(git rev-parse HEAD 2>/dev/null || echo "")
-    cd "${REPO_DIR}"
-    INITIAL_COMMIT=$(cd "${REPO_DIR}" && git rev-parse HEAD 2>/dev/null || echo "")
-    # Prove the final source differs from the initial commit (assertion 5)
-    if [[ -n "${FINAL_INITIAL}" && -n "${INITIAL_COMMIT}" ]]; then
-        if [[ "${FINAL_INITIAL}" != "${INITIAL_COMMIT}" ]]; then
-            echo "  PASS: final commit differs from initial"
+    # Verify HEAD equals the reported final commit SHA
+    HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+    if [[ -n "${HEAD_SHA}" && -n "${FINAL_SH}" ]]; then
+        if [[ "${HEAD_SHA}" == "${FINAL_SH}" || "${HEAD_SHA}" == "${FINAL_SH}"* ]]; then
+            echo "  PASS: final checkout HEAD matches reported commit SHA"
             PASS=$((PASS + 1))
         else
-            echo "  FAIL: final commit matches initial — no changes detected"
+            echo "  FAIL: HEAD (${HEAD_SHA}) != reported SHA (${FINAL_SH})"
             FAIL=$((FAIL + 1))
         fi
     else
-        echo "  SKIP: could not compare commits (final=${FINAL_INITIAL} initial=${INITIAL_COMMIT})"
+        echo "  FAIL: could not resolve HEAD or FINAL_SH"
+        FAIL=$((FAIL + 1))
     fi
-    rm -rf "${FETCH_DIR}"
+    cd - >/dev/null
 fi
 
-# ── 15. Run pytest against the final branch (assertion 6) ──────────────────
-STAGE="run pytest on final branch"
-echo "--- Run pytest ---"
-if cd "${REPO_DIR}" && uv run pytest -q 2>/dev/null; then
-    echo "  PASS: pytest passed against final branch"
-    PASS=$((PASS + 1))
+# ── 14. Import multiply and divide from the final checkout ─────────────────
+STAGE="import from final checkout"
+echo "--- Import multiply & divide from final checkout ---"
+if [[ -d "${VERIFY_DIR}" ]]; then
+    HAS_MULTIPLY=$(cd "${VERIFY_DIR}" && python3 -c "from calculator import multiply; print('yes')" 2>/dev/null || echo "no")
+    check "multiply function added in final checkout (strict)" "yes" "${HAS_MULTIPLY}"
+    HAS_DIVIDE=$(cd "${VERIFY_DIR}" && python3 -c "from calculator import divide; print('yes')" 2>/dev/null || echo "no")
+    check "divide function added in final checkout (strict)" "yes" "${HAS_DIVIDE}"
 else
-    echo "  FAIL: pytest failed against final branch"
+    echo "  FAIL: verify directory missing"
     FAIL=$((FAIL + 1))
 fi
 
+# ── 15. Run pytest against the FINAL checkout (not the base checkout) ─────
+STAGE="run pytest on final checkout"
+echo "--- Run pytest in final checkout ---"
+if [[ -d "${VERIFY_DIR}" ]] && cd "${VERIFY_DIR}" && uv run pytest -q 2>/dev/null; then
+    echo "  PASS: pytest passed against final checkout"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: pytest failed against final checkout"
+    FAIL=$((FAIL + 1))
+fi
+cd - >/dev/null 2>/dev/null || true
+
 # ── 16. HTML and JSON reports exist ─────────────────────────────────────────
-# (assertion 10: poll until the report exists)
 STAGE="check reports"
 echo "--- Reports ---"
 poll_until "report exists" 120 "${BASE}/composer/objectives/${OBJ_ID}/report" \
@@ -380,7 +501,7 @@ check_contains "JSON report ref present" ".\{3\}" "${JSON}"
 echo "  html=${HTML}"
 echo "  json=${JSON}"
 
-# ── 17. Reports contain downstream artifact references (assertion 11) ────
+# ── 17. Reports contain downstream artifact references ────────────────────
 STAGE="check report downstream artifacts"
 echo "--- Downstream Artifact References ---"
 if [[ -f "${JSON}" ]]; then
@@ -395,17 +516,12 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# ── 18. Objective completed (assertion 12) ──────────────────────
+# ── 18. Objective completed ───────────────────────────────────────────────
 STAGE="check completion"
 echo "--- Completion ---"
-R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}")
-STATUS=$(echo "$R" | python3 -c "
-import sys,json
-d = json.load(sys.stdin)
-spec = d.get('composer_spec', {})
-print(spec.get('status',''))
-")
-check "objective completed" "completed" "${STATUS}"
+poll_until "objective completed" 60 "${BASE}/composer/objectives/${OBJ_ID}" \
+    "import sys,json; d=json.load(sys.stdin); spec=d.get('composer_spec',{}); print(spec.get('status',''))" \
+    "completed"
 
 echo ""
 echo "=== Composer Live E2E Complete ==="

@@ -109,6 +109,12 @@ class VerificationCommand(BaseModel):
     name: str = ""
     command: str = ""
     required: bool = True
+    # Runtime evidence fields (populated from Agents Gateway responses)
+    exit_code: int | None = None
+    blocked: bool = False
+    blocked_reason: str = ""
+    output_artifact: str = ""
+    duration_seconds: float | None = None
 
 
 class VerificationSpec(BaseModel):

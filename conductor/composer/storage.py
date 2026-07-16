@@ -319,6 +319,20 @@ class ComposerStorage:
             ).fetchone()
         return self._row_to_composer_plan(row) if row else None
 
+    def count_plans_by_objective(self, objective_id: str) -> int:
+        """Number of plan rows for an objective.
+
+        Used by the planning-idempotency proof test to assert exactly one
+        plan row after a supervisor tick that crashed once before the
+        spec.status update landed.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM composer_plans WHERE objective_id = ?",
+                (objective_id,),
+            ).fetchone()
+            return int(row["n"]) if row else 0
+
     def update_plan(
         self,
         plan_id: str,

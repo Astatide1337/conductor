@@ -271,6 +271,26 @@ class ComposerService:
         return ctx
 
     async def _create_and_activate_plan(self, spec: dict, objective_id: str) -> dict | None:
+        # ── Idempotency guard ────────────────────────────────────────
+        # If a crash leaves spec.status=planning after we already inserted
+        # a plan row, do NOT generate another plan. Reuse (and activate)
+        # the existing draft/active plan so subsequent start_objective
+        # tick converges instead of duplicating plan rows.
+        existing = self.storage.get_plan_by_objective(objective_id)
+        if existing and existing.get("status") in ("draft", "active", "completed"):
+            if existing["status"] == "draft":
+                self.storage.update_plan(existing["id"], status="active",
+                                        activated_at=_now_iso())
+                composer_emit(self.conductor_storage,
+                              "composer.plan_activated", "",
+                              objective_id=objective_id,
+                              payload={"plan_id": existing["id"],
+                                       "reused": True})
+            self.storage.update_spec(spec["id"], status="planned")
+            if self.metrics:
+                self.metrics.inc("conductor_composer_plans_reused_total")
+            return {"plan_id": existing["id"], "reused": True}
+
         self.storage.update_spec(spec["id"], status="planning")
         composer_emit(self.conductor_storage, "composer.planning_started", "",
                       objective_id=objective_id)
@@ -790,6 +810,115 @@ class ComposerService:
 
         if self.metrics:
             self.metrics.inc("conductor_composer_objectives_completed_total")
+
+    async def force_completion(self, objective_id: str) -> dict:
+        """DEV-ONLY: drive the mock Agents Gateway tasks through completion,
+        verification, integration, finalize, and report generation. Returns
+        a JSON-serializable summary of what was driven.
+
+        This endpoint is the engine behind ``scripts/e2e-composer-local.sh``
+        — it lets the local end-to-end script deterministically prove
+        completion, integration verification, and report+objective-completed
+        state WITHOUT waiting on real agents or shell/tmux.
+
+        Disabled in production: ComposerService refuses to run this when
+        ``test_mode`` is False OR when ``MockAgentsGatewayClient`` is not
+        the configured downstream. The HTTP endpoint gates twice
+        (config + isinstance).
+        """
+        if not getattr(self.config, "test_mode", False):
+            return {"error": "force_completion only available when composer.test_mode is true"}
+        # Detect mock-only downstream by checking for the mock-specific
+        # ``complete_task`` accepting arbitrary output strings without
+        # raising. We use the simplest test: the mock client carries
+        # ``set_verification`` as a public method (other clients do not).
+        gw = self.agents_gateway
+        if not hasattr(gw, "set_verification") or not hasattr(gw, "set_task_worktree"):
+            return {"error": "force_completion only available with a mock gateway"}
+
+        spec = self.storage.get_spec_by_objective(objective_id)
+        plan_dict = self.storage.get_plan_by_objective(objective_id)
+        if not spec or not plan_dict:
+            return {"error": "spec or plan not found"}
+
+        actions: list[str] = []
+        # Drive each plan task that has a GW task ID to completed, set a
+        # passing verification record, and set a worktree branch/commit.
+        # Skip integration until all impls are completed — then run the
+        # integration dispatcher through reconcile.
+        for pt in plan_dict.get("plan_tasks", []):
+            gw_id = pt.get("agents_gateway_task_id")
+            node_key = pt.get("node_key", "")
+            if not gw_id or node_key == "integration":
+                continue
+            try:
+                gw.complete_task(gw_id, f"done {node_key}")
+            except Exception as exc:
+                actions.append(f"complete_task({node_key}) failed: {exc}")
+                continue
+            gw.set_verification(gw_id, "passed", [
+                {"name": "unit tests", "command": "uv run pytest -q",
+                 "passed": True, "required": True,
+                 "blocked": False, "blocked_reason": "",
+                 "exit_code": 0, "output_artifact": "",
+                 "duration_seconds": 0.5},
+            ])
+            gw.set_task_worktree(gw_id,
+                                 branch=f"feat/{node_key}",
+                                 commit_sha=f"sha{node_key}")
+            actions.append(f"completed {node_key} gw_id={gw_id}")
+
+        # Drive integration through the integration dispatcher via
+        # reconcile_objective. Integration dispatcher's check should now
+        # find impls ready.
+        rec = await self.reconcile_objective(objective_id)
+        actions.append(f"reconcile actions: {len(rec.get('actions', []))}")
+
+        # If integration has been dispatched through reconcile, drive
+        # that to completion too and re-reconcile to finalize.
+        plan_dict = self.storage.get_plan_by_objective(objective_id)
+        for pt in plan_dict.get("plan_tasks", []):
+            gw_id = pt.get("agents_gateway_task_id")
+            if not gw_id or pt.get("node_key") != "integration":
+                continue
+            try:
+                gw.complete_task(gw_id, "integration done")
+                gw.set_verification(gw_id, "passed", [
+                    {"name": "full test suite", "command": "uv run pytest -q",
+                     "passed": True, "required": True,
+                     "blocked": False, "blocked_reason": "",
+                     "exit_code": 0, "output_artifact": "",
+                     "duration_seconds": 1.0},
+                ])
+                gw.set_task_worktree(gw_id,
+                                     branch="integration/main",
+                                     commit_sha="intsha123")
+                actions.append(f"completed integration gw_id={gw_id}")
+            except Exception as exc:
+                actions.append(f"integration complete failed: {exc}")
+            break
+
+        # The second reconcile runs finalize_objective + report +
+        # objective completed.
+        rec2 = await self.reconcile_objective(objective_id)
+        actions.append(f"final reconcile actions: {len(rec2.get('actions', []))}")
+
+        # Sanity: confirm spec is now completed.
+        spec_after = self.storage.get_spec_by_objective(objective_id)
+        final_status = spec_after.get("status", "unknown") if spec_after else "missing"
+        # If still not completed (likely integration dispatcher missed),
+        # try once more with a short delay.
+        if final_status != "completed":
+            rec3 = await self.reconcile_objective(objective_id)
+            actions.append(f"third reconcile actions: {len(rec3.get('actions', []))}")
+            spec_after = self.storage.get_spec_by_objective(objective_id)
+            final_status = spec_after.get("status", "unknown") if spec_after else "missing"
+
+        return {
+            "objective_id": objective_id,
+            "actions": actions,
+            "final_status": final_status,
+        }
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
