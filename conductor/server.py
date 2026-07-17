@@ -8,7 +8,7 @@ from contextvars import ContextVar
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 
 from conductor import VERSION
 from conductor.auth import AuthHandler, _make_auth_middleware_cls, make_mcp_auth_middleware_cls
@@ -72,31 +72,47 @@ def _build_gateway_client(cfg: ConductorConfig) -> BaseAgentsGatewayClient:
 
 def _build_skills_client(cfg: ConductorConfig) -> BaseSkillsGatewayClient | None:
     sk_cfg = cfg.skills_gateway
-    if sk_cfg.url and sk_cfg.auth_mode != "dev-none" and not _is_localhost_url(sk_cfg.url):
+    is_test = cfg.composer.test_mode or cfg.environment in ("test", "dev")
+    if not sk_cfg.url:
+        return None
+    if not _is_localhost_url(sk_cfg.url):
+        if sk_cfg.auth_mode != "dev-none":
+            return HttpSkillsGatewayClient(sk_cfg)
+        return None
+    # localhost URL — use real client in production, None in dev/test
+    if not is_test:
         return HttpSkillsGatewayClient(sk_cfg)
-    # None means "skills validation is a no-op" — falls back to "all skills valid"
-    # In dev / offline we register nothing, so the dry-run will note missing skills.
     return None
 
 
 def _build_mcp_gateway_client(cfg: ConductorConfig) -> BaseMcpGatewayClient | None:
     """Real MCP Gateway client when URL + non-dev auth configured; None otherwise.
 
-    Conductor never presents dev-none to a downstream gateway if the operator
-    told us the MCP Gateway URL is real — we drop back to None so the registry
-    can mark the gateway not_configured for the operator to wire up.
+    Follows the same pattern as _build_gateway_client:
+    - production + localhost URL → real HTTP client (not mock)
+    - dev/test + localhost URL → mock (offline dev)
+    - remote URL + any auth mode except dev-none → real HTTP client
     """
     mcp_cfg = cfg.mcp_gateway
-    if mcp_cfg.url and mcp_cfg.auth_mode != "dev-none" and not _is_localhost_url(mcp_cfg.url):
+    is_test = cfg.composer.test_mode or cfg.environment in ("test", "dev")
+    if not mcp_cfg.url:
+        return None
+    if not _is_localhost_url(mcp_cfg.url):
+        if mcp_cfg.auth_mode != "dev-none":
+            try:
+                return HttpMcpGatewayClient(mcp_cfg)
+            except McpGatewayError as e:
+                logger.warning("mcp_gateway_init_failed url=%s err=%s", mcp_cfg.url, e)
+                return None
+        return None
+    # localhost URL
+    if not is_test:
         try:
             return HttpMcpGatewayClient(mcp_cfg)
         except McpGatewayError as e:
             logger.warning("mcp_gateway_init_failed url=%s err=%s", mcp_cfg.url, e)
             return None
-    if mcp_cfg.url and _is_localhost_url(mcp_cfg.url):
-        # Pure-local dev mock — easy offline experimentation.
-        return MockMcpGatewayClient()
-    return None
+    return MockMcpGatewayClient()
 
 
 def _is_localhost_url(url: str) -> bool:
@@ -784,6 +800,34 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         if not report:
             raise HTTPException(404, "Report not found")
         return report
+
+    @app.get("/composer/objectives/{objective_id}/report/html")
+    async def composer_get_report_html(objective_id: str, request: Request):
+        import os
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        report = composer.get_report(objective_id)
+        if not report:
+            raise HTTPException(404, "Report not found")
+        html_path = report.get("html_artifact_ref", "")
+        if not html_path or not os.path.isfile(html_path):
+            raise HTTPException(404, "HTML report file not found")
+        return FileResponse(html_path, media_type="text/html")
+
+    @app.get("/composer/objectives/{objective_id}/report/json")
+    async def composer_get_report_json(objective_id: str, request: Request):
+        import os
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        report = composer.get_report(objective_id)
+        if not report:
+            raise HTTPException(404, "Report not found")
+        json_path = report.get("json_artifact_ref", "")
+        if not json_path or not os.path.isfile(json_path):
+            raise HTTPException(404, "JSON report file not found")
+        return FileResponse(json_path, media_type="application/json")
 
     @app.post("/composer/objectives/{objective_id}/start")
     async def composer_start(objective_id: str, request: Request):

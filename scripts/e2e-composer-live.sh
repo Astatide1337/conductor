@@ -11,10 +11,12 @@
 #   6. required task verification records passed via real GW endpoints
 #   7. integration task completed
 #   8. integration verification passed via real GW endpoint
-#   9. final branch and commit SHA recovered from real evidence
-#  10. HTML and JSON reports generated
-#  11. reports contain verification and artifact evidence
-#  12. objective completed
+#   9. integration branch pushed to remote (auto_push required)
+#  10. final branch and commit SHA recovered from real evidence
+#  11. final commit SHA differs from starting baseline (work was actually done)
+#  12. HTML and JSON report content fetched via HTTP (not local filesystem)
+#  13. reports contain verification and downstream artifact evidence
+#  14. objective completed
 #
 # Initial repo contains ONLY add(a,b) — multiply/divide are produced by the Composer pipeline.
 #
@@ -33,6 +35,7 @@ REQUIRED_ENV=(
     CONDUCTOR_BASE_URL CONDUCTOR_AUTH_MODE CONDUCTOR_INTERNAL_TOKEN
     CONDUCTOR_COMPOSER_LLM_BASE_URL CONDUCTOR_COMPOSER_LLM_API_KEY CONDUCTOR_COMPOSER_LLM_MODEL
     CONDUCTOR_AGENTS_GATEWAY_URL CONDUCTOR_AGENTS_GATEWAY_AUTH_MODE CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN
+    AGW_HARNESS__AUTO_PUSH
 )
 
 MISSING=()
@@ -243,6 +246,24 @@ if [[ "${REPO_URL}" == file://* && -d "${REPO_DIR}/.git" ]]; then
     BRANCH_NAME=$(cd "${REPO_DIR}" && git rev-parse --abbrev-ref HEAD)
 fi
 
+# ── Disposable starting state proof ───────────────────────────────────────
+# Record the starting commit SHA so we can prove the pipeline actually
+# changed the code.  For HTTP repos, clone into a temp dir to capture
+# the exact baseline commit before the pipeline runs.
+BASELINE_SHA=""
+if [[ "${REPO_URL}" == file://* && -d "${REPO_DIR}/.git" ]]; then
+    BASELINE_SHA=$(cd "${REPO_DIR}" && git rev-parse HEAD)
+else
+    # Clone to capture the baseline from the remote, then discard
+    BASELINE_CLONE_DIR="/tmp/composer-baseline-$(date +%s)"
+    git clone --bare "${REPO_URL}" "${BASELINE_CLONE_DIR}" 2>/dev/null || true
+    if [[ -d "${BASELINE_CLONE_DIR}/HEAD" || -d "${BASELINE_CLONE_DIR}/objects" ]]; then
+        BASELINE_SHA=$(git -C "${BASELINE_CLONE_DIR}" rev-parse HEAD 2>/dev/null || echo "")
+    fi
+    rm -rf "${BASELINE_CLONE_DIR}" 2>/dev/null || true
+fi
+echo "  baseline_sha=${BASELINE_SHA}"
+
 R=$(curl -sf -X POST "${BASE}/composer/objectives" \
     -H "Content-Type: application/json" \
     -H "${AUTH_HEADER}" \
@@ -381,7 +402,7 @@ print(f'passed={passed_count} failures={required_cmd_failures} integration_passe
 " 2>/dev/null || echo "passed=0 failures=0 integration_passed=False")
 echo "  verification: ${VERIF_RESULT}"
 check_contains "at least 2 tasks with verification passed via real GW" "passed=2\|passed=3\|passed=4\|passed=5" "${VERIF_RESULT}"
-check_contains "0 required command failures" "^failures=0$" "${VERIF_RESULT}"
+check_contains "0 required command failures" "failures=0" "${VERIF_RESULT}"
 
 # ── 10. Integration task completed ────────────────────────────────────────
 poll_until "integration completed" $((TIMEOUT_SEC - 100)) "${BASE}/composer/objectives/${OBJ_ID}/tasks" \
@@ -418,6 +439,34 @@ else:
         print(f'error: {e}')
 " 2>/dev/null || echo "error")
 check "integration verification passed (real GW)" "passed" "${INTEG_VERIF}"
+
+# ── 11b. Integration branch was pushed to remote (auto_push proof) ──────────
+STAGE="check integration pushed"
+echo "--- Integration Push Proof ---"
+INTEG_PUSHED=$(echo "$R" | python3 -c "
+import sys, json, os, urllib.request
+tasks = json.load(sys.stdin).get('tasks', [])
+gw_base = os.environ.get('CONDUCTOR_AGENTS_GATEWAY_URL', '')
+gw_token = os.environ.get('CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN', '')
+headers = {}
+if gw_token:
+    headers['X-Auth-Internal-Token'] = gw_token
+it = [t for t in tasks if t.get('node_key')=='integration']
+pushed = 'false'
+if it and it[0].get('agents_gateway_task_id'):
+    gw_id = it[0]['agents_gateway_task_id']
+    try:
+        req = urllib.request.Request(f'{gw_base}/artifacts/{gw_id}?view=true', headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read()
+            result = json.loads(data) if isinstance(data, bytes) else json.loads(str(data))
+            git_info = result.get('git', {}) if isinstance(result, dict) else {}
+            pushed = str(git_info.get('pushed', False)).lower()
+    except Exception:
+        pass
+print(pushed)
+" 2>/dev/null || echo "false")
+check "integration branch pushed to remote (auto_push required)" "true" "${INTEG_PUSHED}"
 
 # ── 12. Final branch and commit SHA recovered from real evidence ───────────
 STAGE="check branch/commit"
@@ -463,6 +512,24 @@ else
 fi
 
 # ── 14. Import multiply and divide from the final checkout ─────────────────
+# ── 13b. Prove that work was actually done — final commit SHA must
+#       differ from the baseline starting SHA.
+STAGE="check commit delta"
+echo "--- Commit Delta Proof ---"
+if [[ -n "${BASELINE_SHA}" && -n "${FINAL_SH}" ]]; then
+    if [[ "${BASELINE_SHA}" != "${FINAL_SH}" ]]; then
+        echo "  PASS: final commit differs from baseline (work was done)"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: final commit SHA (${FINAL_SH}) == baseline SHA (${BASELINE_SHA}) — no work done"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo "  WARN: cannot compare — baseline or final SHA missing"
+    FAIL=$((FAIL + 1))
+fi
+
+# ── 15. Import multiply and divide from the final checkout ─────────────────
 STAGE="import from final checkout"
 echo "--- Import multiply & divide from final checkout ---"
 if [[ -d "${VERIFY_DIR}" ]]; then
@@ -487,34 +554,28 @@ else
 fi
 cd - >/dev/null 2>/dev/null || true
 
-# ── 16. HTML and JSON reports exist ─────────────────────────────────────────
+# ── 16. HTML and JSON report content served via HTTP ───────────────────────
 STAGE="check reports"
-echo "--- Reports ---"
+echo "--- Reports (via HTTP) ---"
 poll_until "report exists" 120 "${BASE}/composer/objectives/${OBJ_ID}/report" \
     "import sys,json; d=json.load(sys.stdin); print(d.get('json_artifact_ref',''))" \
     "[a-z]"
-R=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/report")
-HTML=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('html_artifact_ref',''))")
-JSON=$(echo "$R" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('json_artifact_ref',''))")
-check_contains "HTML report ref present" ".\{3\}" "${HTML}"
-check_contains "JSON report ref present" ".\{3\}" "${JSON}"
-echo "  html=${HTML}"
-echo "  json=${JSON}"
+
+# Fetch the JSON report content via the dedicated HTTP endpoint
+REPORT_JSON=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/report/json" 2>/dev/null || echo "{}")
+REPORT_HTML=$(curl -sf -H "${AUTH_HEADER}" "${BASE}/composer/objectives/${OBJ_ID}/report/html" 2>/dev/null || echo "")
+check_contains "JSON report content fetched via HTTP" "objective_id" "${REPORT_JSON}"
+check_contains "HTML report content fetched via HTTP" "<html" "${REPORT_HTML}"
 
 # ── 17. Reports contain downstream artifact references ────────────────────
 STAGE="check report downstream artifacts"
 echo "--- Downstream Artifact References ---"
-if [[ -f "${JSON}" ]]; then
-    HAS_VERIF=$(python3 -c "import json; d=json.load(open('${JSON}')); v=d.get('verification',[]); print(len(v))" 2>/dev/null || echo "0")
-    check_contains "report has verification rows" "1\|2\|3\|4\|5" "${HAS_VERIF}"
-    HAS_TASKS=$(python3 -c "import json; d=json.load(open('${JSON}')); t=d.get('task_graph',[]); print(len(t))" 2>/dev/null || echo "0")
-    check_contains "report has task_graph entries" "1\|2\|3\|4\|5" "${HAS_TASKS}"
-    HAS_ARTIFACTS=$(python3 -c "import json; d=json.load(open('${JSON}')); a=d.get('downstream_artifacts',[]); print(len(a))" 2>/dev/null || echo "0")
-    check_contains "report has downstream_artifacts entries" "1\|2\|3\|4\|5" "${HAS_ARTIFACTS}"
-else
-    echo "  FAIL: JSON report file not found"
-    FAIL=$((FAIL + 1))
-fi
+HAS_VERIF=$(echo "${REPORT_JSON}" | python3 -c "import sys,json; d=json.load(sys.stdin); v=d.get('verification',[]); print(len(v))" 2>/dev/null || echo "0")
+check_contains "report has verification rows" "1\|2\|3\|4\|5" "${HAS_VERIF}"
+HAS_TASKS=$(echo "${REPORT_JSON}" | python3 -c "import sys,json; d=json.load(sys.stdin); t=d.get('task_graph',[]); print(len(t))" 2>/dev/null || echo "0")
+check_contains "report has task_graph entries" "1\|2\|3\|4\|5" "${HAS_TASKS}"
+HAS_ARTIFACTS=$(echo "${REPORT_JSON}" | python3 -c "import sys,json; d=json.load(sys.stdin); a=d.get('downstream_artifacts',[]); print(len(a))" 2>/dev/null || echo "0")
+check_contains "report has downstream_artifacts entries" "1\|2\|3\|4\|5" "${HAS_ARTIFACTS}"
 
 # ── 18. Objective completed ───────────────────────────────────────────────
 STAGE="check completion"

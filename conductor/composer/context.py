@@ -358,13 +358,14 @@ def _tool_input_schema(tool) -> dict:
 
 
 def _schema_has_path_param(tool) -> bool:
-    """True iff the tool's input schema requires or accepts ``path``."""
+    """True iff the tool's input schema requires or accepts ``path`` or
+    an equivalent file-path parameter."""
     schema = _tool_input_schema(tool)
     if not schema:
         # No schema advertised — we must NOT assume it accepts ``path``.
         return False
     props = schema.get("properties", {})
-    return "path" in props
+    return any(p in props for p in ("path", "file_path", "filepath"))
 
 
 def _schema_required_keys(tool) -> set[str]:
@@ -493,7 +494,10 @@ def _build_file_tool_args(tool, owner: str, repo: str, path: str) -> dict:
     args: dict = {}
     for key, source in (("owner", owner), ("repo", repo), ("path", path),
                         ("repository", repo), ("file_path", path),
-                        ("filepath", path)):
+                        ("filepath", path),
+                        ("repository_full_name", f"{owner}/{repo}"),
+                        ("repo_full_name", f"{owner}/{repo}"),
+                        ("ref", "")):
         if key in props:
             args[key] = source
     return args
@@ -507,7 +511,10 @@ def _build_tree_tool_args(tool, owner: str, repo: str) -> dict:
     props = schema.get("properties", {})
     args: dict = {}
     for key, source in (("owner", owner), ("repo", repo),
-                        ("repository", repo)):
+                        ("repository", repo),
+                        ("repository_full_name", f"{owner}/{repo}"),
+                        ("repo_full_name", f"{owner}/{repo}"),
+                        ("ref", "")):
         if key in props:
             args[key] = source
     return args

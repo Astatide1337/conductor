@@ -512,6 +512,29 @@ class ComposerService:
                                     metadata=merged,
                                 )
                                 actions.append(f"restarted {pt['node_key']} (attempt {new_attempt})")
+                            else:
+                                # Dispatch refused — mark blocked_external, preserve
+                                # old GW task ID and evidence so the operator can
+                                # inspect. Do NOT leave the task as permanent
+                                # "failed" (which would terminally fail the
+                                # objective via the completion contract).
+                                existing_meta = pt.get("metadata", {}) or {}
+                                failure_meta = {
+                                    **existing_meta,
+                                    "attempt": new_attempt,
+                                    "session_id": session_id or "",
+                                    "failure_context": failure_ctx[:500] if failure_ctx else "",
+                                    "last_restart_failed": True,
+                                    "last_restart_error": "dispatch refused — no new gw_task_id",
+                                    "last_restart_at": _now_iso(),
+                                }
+                                self.storage.update_plan_task(
+                                    pt["id"],
+                                    status="blocked_external",
+                                    agents_gateway_task_id=gw_task_id,
+                                    metadata=failure_meta,
+                                )
+                                actions.append(f"blocked {pt['node_key']} (restart dispatch refused, attempt {new_attempt})")
 
             except Exception as exc:
                 logger.warning("Reconcile failed for task %s: %s", gw_task_id, exc)
