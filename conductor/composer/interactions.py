@@ -297,9 +297,59 @@ class InteractionHandler:
                 dispatch_error = f"scheduler_error: {exc}"
 
             new_gw_task_id = dispatch_result.get("gw_task_id") if dispatch_result else None
+            partial_gw_task_id = dispatch_result.get("partial_gw_task_id") if dispatch_result else None
+            run_failed = dispatch_result.get("run_failed") if dispatch_result else False
         else:
             new_gw_task_id = None
+            partial_gw_task_id = None
+            run_failed = False
             dispatch_error = "no_scheduler_configured"
+
+        # ── Partial creation: create_harness_task succeeded but
+        #     run_task failed.  The phantom task was cancelled by
+        #     _dispatch_one; preserve both the old GW task ID and
+        #     the partial ID, leave blocked_external.
+        if run_failed:
+            failure_meta = {
+                **existing_meta,
+                "attempt": new_attempt,
+                "session_id": session_id,
+                "failure_context": failure_context[:500] if failure_context else "",
+                "attempt_history": attempt_history,
+                "restarted_from_interaction": True,
+                "last_restart_failed": True,
+                "last_restart_error": "run_task failed after create_harness_task (partial creation)",
+                "last_restart_at": _now_iso_safe(),
+                "partial_gw_task_id": partial_gw_task_id,
+            }
+            self.storage.update_plan_task(
+                plan_task_id,
+                status="blocked_external",
+                agents_gateway_task_id=task_id,  # preserve old GW task ID
+                metadata=failure_meta,
+            )
+            decision = self.storage.create_interaction_decision(
+                objective_id=objective_id,
+                action="restart_task_failed",
+                reply=(
+                    f"Partial creation: task {partial_gw_task_id or '(none)'} "
+                    f"was created but failed to start (run_task error). "
+                    f"Original GW task {task_id} preserved."),
+                decision_summary=(
+                    f"Restart of {node_key}: create succeeded but run failed. "
+                    f"Partial GW task {partial_gw_task_id} cancelled. "
+                    f"Old GW task {task_id} preserved. Task blocked_external."),
+                plan_task_id=plan_task_id,
+                agents_gateway_interaction_id=interaction_id,
+            )
+            composer_emit(self.conductor_storage or self.storage,
+                          "composer.task_restart_failed",
+                          "partial creation: create_harness_task succeeded but run_task failed",
+                          objective_id=objective_id, task_id=task_id,
+                          payload={"interaction_id": interaction_id,
+                                   "node_key": node_key,
+                                   "partial_gw_task_id": partial_gw_task_id})
+            return decision
 
         # ── Failure-safe restart ───────────────────────────────────────
         # If dispatch returned no task (or returned an empty string), do

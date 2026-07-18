@@ -30,6 +30,68 @@
 #   - keep the checkout until all assertions finish
 set -uo pipefail
 
+# ── Failure functions + globals + trap MUST be defined before any
+#     prerequisite check — otherwise _block / _fail produce
+#     "command not found" and the script continues in an inconsistent
+#     state.
+STAGE="prerequisites"
+_CANONICAL_PRINTED=false
+PASS=0
+FAIL=0
+VERIFY_DIR=""
+BASELINE_SETUP_DIR=""
+BASELINE_BRANCH=""
+
+_fail() {
+    echo ""
+    echo "COMPOSER LIVE E2E FAILED: ${STAGE:-unknown stage} — $1"
+    _CANONICAL_PRINTED=true
+    exit 1
+}
+
+_block() {
+    echo ""
+    echo "COMPOSER LIVE E2E BLOCKED: ${STAGE:-unknown stage} — $1"
+    _CANONICAL_PRINTED=true
+    exit 2
+}
+
+cleanup() {
+    if [[ -n "${VERIFY_DIR}" && -d "${VERIFY_DIR}" ]]; then
+        rm -rf "${VERIFY_DIR}"
+    fi
+    if [[ -n "${BASELINE_SETUP_DIR}" && -d "${BASELINE_SETUP_DIR}" ]]; then
+        rm -rf "${BASELINE_SETUP_DIR}"
+    fi
+    # Remove the disposable baseline branch if it was created
+    if [[ -n "${BASELINE_BRANCH:-}" && "${REPO_URL:-}" != file://* && "${REPO_URL:-}" != "" ]]; then
+        git push "${REPO_URL}" --delete "${BASELINE_BRANCH}" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+check() {
+    local label="$1" expected="$2" got="$3"
+    if [[ "$got" == "$expected" ]]; then
+        echo "  PASS: ${label}"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: ${label} (expected '${expected}', got '${got}')"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+check_contains() {
+    local label="$1" pattern="$2" text="$3"
+    if echo "$text" | grep -q "$pattern"; then
+        echo "  PASS: ${label}"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: ${label} (expected pattern '${pattern}')"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 # ── Required environment ───────────────────────────────────────────────────
 REQUIRED_ENV=(
     CONDUCTOR_BASE_URL CONDUCTOR_AUTH_MODE CONDUCTOR_INTERNAL_TOKEN
@@ -63,8 +125,6 @@ case "${AGW_HARNESS__AUTO_PUSH,,}" in
 esac
 
 # ── Require an Agents-Gateway-accessible repository ──────────────────────
-# Use file:// only when COMPOSER_LIVE_SHARED_VOLUME=true.
-# Otherwise require COMPOSER_LIVE_REPO_URL.
 REPO_URL="${COMPOSER_LIVE_REPO_URL:-}"
 if [[ -z "${REPO_URL}" ]]; then
     if [[ "${COMPOSER_LIVE_SHARED_VOLUME:-}" == "true" ]]; then
@@ -75,7 +135,6 @@ if [[ -z "${REPO_URL}" ]]; then
 fi
 
 # ── Prove the real LLM client is active ───────────────────────────────────
-# Require production environment and test_mode=false for the live test.
 if [[ "${CONDUCTOR_ENVIRONMENT:-}" != "production" ]]; then
     _block "CONDUCTOR_ENVIRONMENT must be 'production' (got '${CONDUCTOR_ENVIRONMENT:-}')"
 fi
@@ -88,62 +147,6 @@ AUTH_HEADER="X-Auth-Internal-Token: ${CONDUCTOR_INTERNAL_TOKEN}"
 GW_BASE="${CONDUCTOR_AGENTS_GATEWAY_URL}"
 GW_AUTH="X-Auth-Internal-Token: ${CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN}"
 TIMEOUT_SEC="${COMPOSER_LIVE_TIMEOUT_SEC:-600}"
-PASS=0
-FAIL=0
-STAGE=""
-VERIFY_DIR=""
-
-check() {
-    local label="$1" expected="$2" got="$3"
-    if [[ "$got" == "$expected" ]]; then
-        echo "  PASS: ${label}"
-        PASS=$((PASS + 1))
-    else
-        echo "  FAIL: ${label} (expected '${expected}', got '${got}')"
-        FAIL=$((FAIL + 1))
-    fi
-}
-
-check_contains() {
-    local label="$1" pattern="$2" text="$3"
-    if echo "$text" | grep -q "$pattern"; then
-        echo "  PASS: ${label}"
-        PASS=$((PASS + 1))
-    else
-        echo "  FAIL: ${label} (expected pattern '${pattern}')"
-        FAIL=$((FAIL + 1))
-    fi
-}
-
-_CANONICAL_PRINTED=false
-
-_fail() {
-    echo ""
-    echo "COMPOSER LIVE E2E FAILED: ${STAGE:-unknown stage} — $1"
-    _CANONICAL_PRINTED=true
-    exit 1
-}
-
-_block() {
-    echo ""
-    echo "COMPOSER LIVE E2E BLOCKED: ${STAGE:-unknown stage} — $1"
-    _CANONICAL_PRINTED=true
-    exit 2
-}
-
-cleanup() {
-    if [[ -n "${VERIFY_DIR}" && -d "${VERIFY_DIR}" ]]; then
-        rm -rf "${VERIFY_DIR}"
-    fi
-    if [[ -n "${BASELINE_SETUP_DIR}" && -d "${BASELINE_SETUP_DIR}" ]]; then
-        rm -rf "${BASELINE_SETUP_DIR}"
-    fi
-    # Remove the disposable baseline branch if it was created
-    if [[ -n "${BASELINE_BRANCH:-}" && "${REPO_URL}" != file://* && "${REPO_URL}" != "" ]]; then
-        git push origin --delete "${BASELINE_BRANCH}" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT
 
 poll_until() {
     local desc="$1" max_sec="$2" url="$3" extract_py="$4" expected="$5"
@@ -288,15 +291,22 @@ else
     echo "--- Establish Disposable Baseline (orphan branch) ---"
 
     # 1. Clone into a throwaway setup directory
-    if git clone "${REPO_URL}" "${BASELINE_SETUP_DIR}" 2>/dev/null; then true; else
+    if ! git clone "${REPO_URL}" "${BASELINE_SETUP_DIR}" 2>/dev/null; then
         _fail "baseline clone failed"
     fi
 
-    cd "${BASELINE_SETUP_DIR}"
+    cd "${BASELINE_SETUP_DIR}" || _fail "cannot cd into baseline setup dir"
 
-    # 2. Create orphan branch
-    git checkout --orphan "${BASELINE_BRANCH}" 2>/dev/null
-    # 3. Remove all tracked content from staging (orphan starts empty)
+    # 2. Configure Git identity (CI runners lack global config)
+    git config user.email "composer-e2e@local" 2>/dev/null
+    git config user.name     "Composer Live E2E"   2>/dev/null
+
+    # 3. Create orphan branch
+    if ! git checkout --orphan "${BASELINE_BRANCH}" 2>/dev/null; then
+        _fail "baseline checkout --orphan failed"
+    fi
+
+    # 4. Remove all tracked content from staging (orphan starts empty)
     git rm -rf --quiet . 2>/dev/null || true
 
     # 4. Populate with exactly the add-only files
@@ -355,8 +365,14 @@ EOF
 
     # 9. Commit baseline
     git add calculator/__init__.py calculator/test_calculator.py pyproject.toml
-    git commit --quiet -m "baseline: add-only calculator" 2>/dev/null
-    BASELINE_SHA=$(git rev-parse HEAD)
+    if ! git commit --quiet -m "baseline: add-only calculator" 2>/dev/null; then
+        _fail "baseline commit failed"
+    fi
+
+    BASELINE_SHA=$(git rev-parse HEAD 2>/dev/null) || BASELINE_SHA=""
+    if [[ -z "${BASELINE_SHA}" ]]; then
+        _fail "baseline rev-parse failed"
+    fi
     echo "  baseline_sha=${BASELINE_SHA}"
 
     # 10. Push baseline branch

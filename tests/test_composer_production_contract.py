@@ -1923,6 +1923,247 @@ class TestFailedTaskRestartFailureSafe:
         assert meta.get("last_restart_failed") is True
 
 
+# ── 22b. Initial dispatch partial failure ────────────────────────────────
+#        create_harness_task succeeds, run_task fails on attempt 1 —
+#        plan task must go to blocked_external, not counted as dispatched.
+
+
+class TestInitialDispatchPartialFailure:
+    """Partial creation on the very first dispatch must be detected
+    and NOT counted as successfully dispatched."""
+
+    @pytest.mark.asyncio
+    async def test_initial_dispatch_partial_handled_not_counted(self, setup):
+        """During initial dispatch, create_harness_task succeeds but
+        run_task fails on attempt 1.  The plan task must end up
+        blocked_external with the partial gw_task_id tracked, and
+        dispatch_ready_tasks must return a list that does NOT contain
+        this node."""
+        svc, gw, cs, cps, d, db = setup
+        r = await svc.submit_specification(
+            title="Initial partial", raw_spec="Build x", auto_start=True)
+        obj_id = r["objective_id"]
+
+        # Start up to planning but stop short of executing — we want
+        # to call an intermediate state that only plans but doesn't
+        # dispatch yet.
+        await svc.start_objective(obj_id)          # received → normalized → planned
+        # At this point spec is "planned" and NO tasks are dispatched.
+        # Note: start_objective calls _dispatch_ready which dispatches
+        # on the planned→executing transition.  Our mock harness is
+        # runnable so the task IS dispatched on the first tick.
+        # But we need the second dispatch (after reconcile sees that
+        # nothing is running yet) to be the one we observe.
+
+        # We'll fail the already-dispatched task so reconcile fires
+        # a restart (attempt >= 2), while we separately test the
+        # first-dispatch path by creating a NEW spec and patching
+        # run_task to fail on the very first dispatch tick.
+
+        r2 = await svc.submit_specification(
+            title="First dispatch crash", raw_spec="Build y", auto_start=True)
+        obj2 = r2["objective_id"]
+
+        # Advance to planned, then make run_task crash on the
+        # _dispatch_ready call that happens inside start_objective
+        # (status "planned" → "executing").  We need the scheduler's
+        # _dispatch_one to pass through create_harness_task (mock
+        # succeeds) but then run_task raises.
+        #
+        # Strategy: patch the gateway's run_task to raise before
+        # start_objective reaches planned→executing.  We advance
+        # to planned first so the next tick dispatches.
+        await svc.start_objective(obj2)             # received → normalized → planned
+        # Spec is "planned", tasks should be pending — dispatch hasn't
+        # happened yet (because the spec transitions planned→executing
+        # inside _dispatch_ready, not in start_objective). Wait, let
+        # me re-check: start_objective at status "planned" calls
+        # _dispatch_ready.  If dispatched, it sets status="executing".
+        #
+        # Let's force patch generation and status to "planned" directly
+        # so the next tick dispatches and we can observe.
+
+        # Simpler: manually call _dispatch_ready with a patched
+        # run_task that raises.  We'll create a spec, skip dispatch
+        # in start_objective by patching, then call _dispatch_ready
+        # directly.
+
+        # Clear gateway to start fresh
+        # (MockAgentsGatewayClient doesn't need clearing but let's
+        #  be precise)
+        original_run = gw.run_task
+
+        def crashy_run(task_id):
+            raise RuntimeError("mock run_task exploded")
+
+        try:
+            # 1) Advance to planned
+            await svc.start_objective(obj2)
+            spec = cps.get_spec_by_objective(obj2)
+            assert spec["status"] in ("planned", "executing"), (
+                f"spec should be planned/executing, got {spec['status']}")
+            plan = cps.get_plan_by_objective(obj2)
+            tasks = plan.get("plan_tasks", [])
+            impls = [t for t in tasks if t.get("node_key") != "integration"]
+            assert impls, "must have at least one impl task node"
+
+            # 2) Patch run_task to raise so the next dispatch tick
+            #    hits partial creation
+            gw.run_task = crashy_run
+
+            # 3) Manually invoke dispatch_ready_tasks through the
+            #    service's _dispatch_ready gateway path.  Mock the
+            #    gateway's create_harness_task preserves normal
+            #    behaviour (mock handles it).
+            dispatched = await svc._dispatch_ready(obj2)
+
+            # Even if the spec was already "executing" from a previous
+            # tick, _dispatch_ready respects max_parallel so a crashy
+            # run_task on a new ready node must NOT appear in
+            # dispatched list.
+            #
+            # dispatched is a list of dicts; each non-partial dict
+            # has gw_task_id set.
+            partials = [d for d in dispatched if d.get("gw_task_id") is None and d.get("run_failed")]
+            assert not partials, (
+                "dispatch_ready_tasks must not return partial-creation dicts "
+                "from the first dispatch — partials must return None/be excluded")
+
+            # The task that run_task crashed on must now be
+            # blocked_external.
+            plan_after = cps.get_plan_by_objective(obj2)
+            for pt in plan_after["plan_tasks"]:
+                meta = pt.get("metadata", {})
+                if meta.get("last_dispatch_failed"):
+                    assert pt["status"] == "blocked_external", (
+                        f"partial first dispatch must produce blocked_external, "
+                        f"got {pt['status']}")
+                    assert meta.get("dispatch_error"), (
+                        "metadata must contain the run_task error")
+                    assert meta.get("partial_gw_task_id"), (
+                        "metadata must preserve the phantom gw_task_id")
+                    return
+
+            # If no task has last_dispatch_failed, it means either
+            # run_task didn't fire (no ready nodes) or the mock
+            # gateway didn't create_harness_task.  Let's dispatch
+            # more explicitly.
+            plan_obj = svc._dict_to_plan(plan)
+            node = plan_obj.tasks[0]
+            result = svc.scheduler._dispatch_one(
+                node, spec, obj2, plan["id"],
+                spec.get("repository_url", ""),
+                spec.get("base_branch", "master"),
+                attempt=1,
+            )
+            assert result is None, (
+                f"attempt-1 partial must return None to exclude from "
+                f"dispatched list, got {result}")
+
+            plan_after = cps.get_plan_by_objective(obj2)
+            blocked = [t for t in plan_after["plan_tasks"]
+                       if t.get("node_key") == node.node_id
+                       and t.get("status") == "blocked_external"]
+            assert blocked, (
+                f"after attempt-1 partial, plan task {node.node_id} must be "
+                f"blocked_external")
+            meta_final = blocked[0].get("metadata", {})
+            assert meta_final.get("partial_gw_task_id"), (
+                "partial_gw_task_id must be preserved")
+            assert meta_final.get("last_dispatch_failed"), (
+                "last_dispatch_failed must be True")
+            assert meta_final.get("dispatch_error"), (
+                "dispatch_error must contain the run_task error")
+
+        finally:
+            gw.run_task = original_run
+
+
+# ── 23. Interaction restart preserves partial_gw_task_id ──────────────────
+
+
+class TestInteractionPartialIdPreservation:
+    """When an interaction-directed restart produces a partial creation
+    (create_harness_task succeeds, run_task fails), the partial_gw_task_id
+    must be recorded alongside the old gw_task_id."""
+
+    @pytest.mark.asyncio
+    async def test_interaction_restart_partial_preserves_partial_id(self, setup):
+        svc, gw, cs, cps, d, db = setup
+        r = await svc.submit_specification(
+            title="Interaction partial", raw_spec="Build x", auto_start=True)
+        obj_id = r["objective_id"]
+        await svc.start_objective(obj_id)
+
+        plan = cps.get_plan_by_objective(obj_id)
+        impl = next((t for t in plan["plan_tasks"]
+                     if t.get("agents_gateway_task_id")
+                     and t.get("node_key") != "integration"), None)
+        assert impl is not None, "must have at least one dispatched task"
+        old_gw_id = impl["agents_gateway_task_id"]
+        plan_task_id = impl["id"]
+
+        # Create a mock interaction
+        gw.create_mock_interaction(old_gw_id, prompt="Restart me — task crashed")
+        interactions = gw.list_interactions(status="pending")
+        assert interactions
+
+        # Force the LLM to vote ``restart_task``
+        from conductor.composer.llm import InteractionResult
+        original_answer = svc.interaction_handler.llm.answer_interaction
+
+        async def answer_restart(*a, **kw):
+            return InteractionResult(
+                action="restart_task",
+                reply="restart the task",
+                decision_summary="restart",
+            )
+        svc.interaction_handler.llm.answer_interaction = answer_restart
+
+        # Patch restart_failed_task to return a partial-creation dict
+        # (run_failed=True with partial_gw_task_id)
+        original_restart = svc.scheduler.restart_failed_task
+
+        partial_result = {
+            "node_id": impl["node_key"],
+            "gw_task_id": None,
+            "partial_gw_task_id": "interaction-partial-888",
+            "run_failed": True,
+        }
+
+        def fake_restart(*a, **kw):
+            return partial_result
+
+        svc.scheduler.restart_failed_task = fake_restart
+        try:
+            decisions = await svc.interaction_handler.process_pending_interactions(
+                obj_id, plan, cps.get_spec_by_objective(obj_id))
+        finally:
+            svc.scheduler.restart_failed_task = original_restart
+            svc.interaction_handler.llm.answer_interaction = original_answer
+
+        assert decisions, "must persist a restart-failure decision"
+        decision = decisions[0]
+        assert decision["action"] == "restart_task_failed", (
+            f"must be restart_task_failed, got {decision['action']}")
+        assert "interaction-partial-888" in decision.get("decision_summary", ""), (
+            "decision summary must mention partial gw task ID")
+
+        # Verify the plan task metadata
+        plan_after = cps.get_plan_by_objective(obj_id)
+        pt = next(t for t in plan_after["plan_tasks"]
+                  if t["id"] == plan_task_id)
+        assert pt["status"] == "blocked_external", (
+            f"partial creation must produce blocked_external, got {pt['status']}")
+        assert pt["agents_gateway_task_id"] == old_gw_id, (
+            "old GW task ID must be preserved")
+        meta = pt.get("metadata", {})
+        assert meta.get("partial_gw_task_id") == "interaction-partial-888", (
+            f"partial_gw_task_id must be recorded, got {meta.get('partial_gw_task_id')}")
+        assert meta.get("last_restart_failed") is True, (
+            "last_restart_failed must be True")
+
+
 # ── 22. Result artifact lookup by artifact ID via GW artifact list ────────
 
 

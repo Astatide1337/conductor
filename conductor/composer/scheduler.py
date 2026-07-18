@@ -205,28 +205,59 @@ class Scheduler:
                 self.agents_gateway.run_task(gw_task.id)
             except Exception as run_exc:
                 # create_harness_task succeeded, run_task failed —
-                # attempt to cancel the phantom task, persist both
-                # old and new GW IDs in evidence, emit restart_failed.
+                # attempt to cancel the phantom task, persist partial
+                # gw_task_id + error in metadata, mark blocked_external.
                 logger.error("run_task failed for new GW task %s (node %s): %s",
                              gw_task.id, node.node_id, run_exc)
                 try:
                     self.agents_gateway.cancel_task(gw_task.id)
                 except Exception:
                     pass
-                composer_emit(self.conductor_storage or self.storage,
-                              "composer.task_restart_failed",
-                              f"run_task_failed: {run_exc}",
-                              objective_id=objective_id,
-                              payload={"node_id": node.node_id,
-                                       "attempt": attempt,
-                                       "new_gw_task_id": gw_task.id,
-                                       "partial_creation": True})
-                return {
-                    "node_id": node.node_id,
-                    "gw_task_id": None,
-                    "partial_gw_task_id": gw_task.id,
-                    "run_failed": True,
-                }
+
+                if pt:
+                    existing_meta = pt.get("metadata", {}) or {}
+                    partial_meta = {
+                        **existing_meta,
+                        "partial_gw_task_id": gw_task.id,
+                        "dispatch_error": str(run_exc),
+                        "last_dispatch_failed": True,
+                        "last_dispatch_failed_at": _now_iso(),
+                    }
+                    self.storage.update_plan_task(
+                        pt["id"],
+                        status="blocked_external",
+                        agents_gateway_task_id=pt.get("agents_gateway_task_id"),
+                        metadata=partial_meta,
+                    )
+
+                if attempt > 1:
+                    composer_emit(self.conductor_storage or self.storage,
+                                  "composer.task_restart_failed",
+                                  f"run_task_failed: {run_exc}",
+                                  objective_id=objective_id,
+                                  payload={"node_id": node.node_id,
+                                           "attempt": attempt,
+                                           "new_gw_task_id": gw_task.id,
+                                           "partial_creation": True})
+                    # Return structured result so restart callers can
+                    # preserve partial_gw_task_id in their audit trail.
+                    return {
+                        "node_id": node.node_id,
+                        "gw_task_id": None,
+                        "partial_gw_task_id": gw_task.id,
+                        "run_failed": True,
+                    }
+                else:
+                    composer_emit(self.conductor_storage or self.storage,
+                                  "composer.task_dispatch_failed",
+                                  f"run_task_failed: {run_exc}",
+                                  objective_id=objective_id,
+                                  payload={"node_id": node.node_id,
+                                           "new_gw_task_id": gw_task.id,
+                                           "partial_creation": True})
+                    # Return None so dispatch_ready_tasks does NOT count
+                    # this node as successfully dispatched.
+                    return None
 
             if pt:
                 self.storage.update_plan_task(pt["id"], status="running")
