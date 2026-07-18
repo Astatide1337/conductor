@@ -8,11 +8,11 @@ from contextvars import ContextVar
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 
 from conductor import VERSION
 from conductor.auth import AuthHandler, _make_auth_middleware_cls, make_mcp_auth_middleware_cls
-from conductor.config import ConductorConfig
+from conductor.config import ConductorConfig, load_config
 from conductor.events import emit, list_events as list_events_fn
 from conductor.logging import (
     bind_request_context,
@@ -45,46 +45,74 @@ from conductor.gateways.registry import GatewayRegistry, GatewayConfig
 
 
 def _build_gateway_client(cfg: ConductorConfig) -> BaseAgentsGatewayClient:
-    """Build the Agents Gateway client. Real HTTP when CONDUCTOR_AGENTS_GATEWAY_URL
-    is set to a non-localhost URL, otherwise a Mock client for offline dev/test.
-    Provides a shared configured agents gateway actor to the HTTP routes + MCP tools,
-    so dispatch and reconcile use the same gateway instance."""
+    """Build the Agents Gateway client.
+
+    Outside explicit test mode:
+    - a configured real URL uses the HTTP client
+    - localhost URLs only use Mock in dev/test environment
+    - missing URL with composer enabled and not test_mode → error
+    """
     gw_cfg = cfg.agents_gateway
-    if gw_cfg.url and gw_cfg.auth_mode != "dev-none" and not _is_localhost_url(gw_cfg.url):
+    is_test = cfg.composer.test_mode or cfg.environment in ("test", "dev")
+    if gw_cfg.url and not _is_localhost_url(gw_cfg.url):
         return HttpAgentsGatewayClient(gw_cfg)
-    # Mock for offline / dev
-    mock = MockAgentsGatewayClient()
-    mock.register_agent("code-validator", "Code Validator")
-    return mock
+    if gw_cfg.url and _is_localhost_url(gw_cfg.url) and not is_test:
+        return HttpAgentsGatewayClient(gw_cfg)
+    if is_test:
+        mock = MockAgentsGatewayClient()
+        mock.register_agent("code-validator", "Code Validator")
+        mock.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        mock.register_harness_profile("pi-coding-agent", "Pi Coding Agent", runnable=True)
+        mock.register_harness_profile("claude-code", "Claude Code", runnable=True)
+        return mock
+    # No URL at all and not test mode — return HttpAgentsGatewayClient with
+    # the default localhost URL, which will produce clear connection errors.
+    return HttpAgentsGatewayClient(gw_cfg)
 
 
 def _build_skills_client(cfg: ConductorConfig) -> BaseSkillsGatewayClient | None:
     sk_cfg = cfg.skills_gateway
-    if sk_cfg.url and sk_cfg.auth_mode != "dev-none" and not _is_localhost_url(sk_cfg.url):
+    is_test = cfg.composer.test_mode or cfg.environment in ("test", "dev")
+    if not sk_cfg.url:
+        return None
+    if not _is_localhost_url(sk_cfg.url):
+        if sk_cfg.auth_mode != "dev-none":
+            return HttpSkillsGatewayClient(sk_cfg)
+        return None
+    # localhost URL — use real client in production, None in dev/test
+    if not is_test:
         return HttpSkillsGatewayClient(sk_cfg)
-    # None means "skills validation is a no-op" — falls back to "all skills valid"
-    # In dev / offline we register nothing, so the dry-run will note missing skills.
     return None
 
 
 def _build_mcp_gateway_client(cfg: ConductorConfig) -> BaseMcpGatewayClient | None:
     """Real MCP Gateway client when URL + non-dev auth configured; None otherwise.
 
-    Conductor never presents dev-none to a downstream gateway if the operator
-    told us the MCP Gateway URL is real — we drop back to None so the registry
-    can mark the gateway not_configured for the operator to wire up.
+    Follows the same pattern as _build_gateway_client:
+    - production + localhost URL → real HTTP client (not mock)
+    - dev/test + localhost URL → mock (offline dev)
+    - remote URL + any auth mode except dev-none → real HTTP client
     """
     mcp_cfg = cfg.mcp_gateway
-    if mcp_cfg.url and mcp_cfg.auth_mode != "dev-none" and not _is_localhost_url(mcp_cfg.url):
+    is_test = cfg.composer.test_mode or cfg.environment in ("test", "dev")
+    if not mcp_cfg.url:
+        return None
+    if not _is_localhost_url(mcp_cfg.url):
+        if mcp_cfg.auth_mode != "dev-none":
+            try:
+                return HttpMcpGatewayClient(mcp_cfg)
+            except McpGatewayError as e:
+                logger.warning("mcp_gateway_init_failed url=%s err=%s", mcp_cfg.url, e)
+                return None
+        return None
+    # localhost URL
+    if not is_test:
         try:
             return HttpMcpGatewayClient(mcp_cfg)
         except McpGatewayError as e:
             logger.warning("mcp_gateway_init_failed url=%s err=%s", mcp_cfg.url, e)
             return None
-    if mcp_cfg.url and _is_localhost_url(mcp_cfg.url):
-        # Pure-local dev mock — easy offline experimentation.
-        return MockMcpGatewayClient()
-    return None
+    return MockMcpGatewayClient()
 
 
 def _is_localhost_url(url: str) -> bool:
@@ -99,7 +127,7 @@ except ImportError:
 
 def _build_mcp_app(cfg: ConductorConfig, storage: ConductorStorage,
                    gateway_client, skills_client, mcp_gateway_client,
-                   gateway_registry, metrics_reg) -> tuple | None:
+                   gateway_registry, metrics_reg, composer_service=None) -> tuple | None:
     """Build the FastMCP ASGI sub-app + its lifespan, ready to mount.
 
     Returns `(mount_path, mcp_asgi)` if FastMCP is available, else None.
@@ -139,6 +167,7 @@ def _build_mcp_app(cfg: ConductorConfig, storage: ConductorStorage,
         metrics=metrics_reg,
         gateway_registry=gateway_registry,
         mcp_gateway_client=mcp_gateway_client,
+        composer_service=composer_service,
     )
     mcp_asgi = mcp_server.http_app(path=cfg.service.mcp_path)
     return (cfg.service.mcp_path, mcp_asgi)
@@ -159,6 +188,65 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         init_conductor_metrics()
         metrics_reg = get_metrics_registry()
 
+    # Build shared gateway clients before MCP and Composer setup
+    gw_client = _build_gateway_client(cfg)
+    skills_client = _build_skills_client(cfg)
+    mcp_gw_client = _build_mcp_gateway_client(cfg)
+    gw_registry = build_default_registry(cfg)
+    # Build the wiki-mcp client from configuration — never ``None`` so
+    # composer never has to guard against a null reference at every call.
+    from conductor.clients.wiki_mcp import build_wiki_mcp_client, NullWikiMcpClient
+    wiki_client = build_wiki_mcp_client(cfg.wiki_mcp)
+    if not isinstance(wiki_client, NullWikiMcpClient):
+        logger.info("Wiki MCP client configured: url=%s auth_mode=%s",
+                    cfg.wiki_mcp.url, cfg.wiki_mcp.auth_mode)
+
+    # ── Composer setup (before MCP so tools can reference it) ────────────
+    app_state_composer = None
+    app_state_composer_supervisor = None
+    if cfg.composer.enabled:
+        from conductor.composer.service import ComposerService
+        from conductor.composer.storage import ComposerStorage
+        from conductor.composer.llm import FakeComposerLLMClient, HttpComposerLLMClient
+        from conductor.composer.supervisor import ComposerSupervisor
+
+        composer_storage = ComposerStorage(cfg.storage.sqlite_path)
+        composer_storage.initialize()
+
+        is_test_mode = cfg.composer.test_mode or cfg.environment in ("test", "dev")
+        if is_test_mode:
+            llm_client = FakeComposerLLMClient()
+        elif cfg.composer.llm_api_key and cfg.composer.llm_model:
+            llm_client = HttpComposerLLMClient(
+                base_url=cfg.composer.llm_base_url,
+                api_key=cfg.composer.llm_api_key,
+                model=cfg.composer.llm_model,
+                timeout=cfg.composer.llm_timeout_seconds,
+            )
+        else:
+            raise RuntimeError(
+                "Composer LLM key/model not configured. Set CONDUCTOR_COMPOSER__LLM_API_KEY "
+                "and CONDUCTOR_COMPOSER__LLM_MODEL, or enable test_mode."
+            )
+
+        app_state_composer = ComposerService(
+            storage=composer_storage,
+            conductor_storage=storage,
+            llm_client=llm_client,
+            agents_gateway_client=gw_client,
+            config=cfg.composer,
+            skills_gateway_client=skills_client,
+            wiki_mcp_client=wiki_client,
+            mcp_gateway_client=mcp_gw_client,
+            gateway_registry=gw_registry,
+            metrics=metrics_reg,
+        )
+        app_state_composer_supervisor = ComposerSupervisor(
+            app_state_composer,
+            poll_interval=cfg.composer.poll_interval_seconds,
+            enabled=True,
+        )
+
     # Build MCP sub-app BEFORE the parent FastAPI app so we can propagate
     # FastMCP's lifespan to the parent — without this, FastMCP's streamable
     # HTTP session manager raises "task group is not initialized" on every
@@ -166,11 +254,29 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
     # If FastMCP is unavailable, mcp_pair is None and the lifespan stays None.
     mcp_pair = _build_mcp_app(
         cfg, storage,
-        _build_gateway_client(cfg), _build_skills_client(cfg),
-        _build_mcp_gateway_client(cfg), build_default_registry(cfg),
+        gw_client, skills_client, mcp_gw_client, gw_registry,
         metrics_reg,
+        composer_service=app_state_composer,
     )
     mcp_lifespan = mcp_pair[1].lifespan if mcp_pair else None
+
+    # Wrap the MCP lifespan to also start/stop the Composer supervisor.
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def app_lifespan(app):
+        # Start Composer supervisor if enabled
+        composer_supervisor = getattr(app.state, "composer_supervisor", None)
+        if composer_supervisor and composer_supervisor.enabled:
+            await composer_supervisor.start()
+        if mcp_lifespan:
+            async with mcp_lifespan(app):
+                yield
+        else:
+            yield
+        # Stop Composer supervisor
+        if composer_supervisor:
+            await composer_supervisor.stop()
 
     app = FastAPI(
         title="Astatide Conductor",
@@ -178,7 +284,7 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
-        lifespan=mcp_lifespan,
+        lifespan=app_lifespan,
     )
 
     # Store shared state
@@ -186,10 +292,14 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
     app.state.storage = storage
     app.state.auth = auth_handler
     app.state.metrics = metrics_reg
-    app.state.gateway_client = _build_gateway_client(cfg)
-    app.state.skills_client = _build_skills_client(cfg)
-    app.state.mcp_gateway_client = _build_mcp_gateway_client(cfg)
-    app.state.gateway_registry = build_default_registry(cfg)
+    app.state.gateway_client = gw_client
+    app.state.skills_client = skills_client
+    app.state.mcp_gateway_client = mcp_gw_client
+    app.state.gateway_registry = gw_registry
+
+    # ── Composer setup (instances pre-built above before MCP) ───────────
+    app.state.composer = app_state_composer
+    app.state.composer_supervisor = app_state_composer_supervisor
 
     # Emit gateway.registered events once at startup so the operator timeline
     # reflects the configured hub at boot.
@@ -209,7 +319,13 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "service": "astatide-conductor"}
+        result: dict = {"status": "ok", "service": "astatide-conductor"}
+        composer = getattr(app.state, "composer", None)
+        if composer is not None:
+            from conductor.composer.llm import FakeComposerLLMClient
+            result["composer_llm_provider"] = "fake" if isinstance(composer.llm, FakeComposerLLMClient) else "http"
+            result["composer_llm_model"] = getattr(composer.llm, "model", "") or getattr(composer.config, "llm_model", "")
+        return result
 
     @app.get("/ready")
     async def ready():
@@ -597,6 +713,187 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         timeline = [e.model_dump() for e in reversed(events)]
         return {"objective_id": objective_id, "count": len(timeline), "events": timeline}
 
+    # ── Composer routes ───────────────────────────────────────────────
+    from pydantic import BaseModel as PydBaseModel
+
+    class ComposerSpecRequest(PydBaseModel):
+        title: str
+        spec: str
+        repository: dict | None = None
+        auto_start: bool = True
+        metadata: dict = {}
+
+    class ComposerSteerRequest(PydBaseModel):
+        guidance: str
+
+    @app.post("/composer/objectives")
+    async def composer_submit_spec(body: ComposerSpecRequest, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        result = await composer.submit_specification(
+            title=body.title, raw_spec=body.spec,
+            repository=body.repository, auto_start=body.auto_start,
+        )
+        if metrics_reg:
+            metrics_reg.inc("conductor_composer_objectives_total")
+            metrics_reg.inc("conductor_composer_objectives_active")
+        return result
+
+    @app.get("/composer/objectives")
+    async def composer_list_objectives(request: Request, status: str | None = None, limit: int = 50, offset: int = 0):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        return {"objectives": composer.list_objectives(status=status, limit=limit, offset=offset)}
+
+    @app.get("/composer/objectives/{objective_id}")
+    async def composer_get_objective(objective_id: str, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        obj = composer.get_objective(objective_id)
+        if not obj:
+            raise HTTPException(404, "Objective not found")
+        return obj
+
+    @app.get("/composer/objectives/{objective_id}/spec")
+    async def composer_get_spec(objective_id: str, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        spec = composer.get_spec(objective_id)
+        if not spec:
+            raise HTTPException(404, "Spec not found")
+        return spec
+
+    @app.get("/composer/objectives/{objective_id}/plan")
+    async def composer_get_plan(objective_id: str, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        plan = composer.get_plan(objective_id)
+        if not plan:
+            raise HTTPException(404, "Plan not found")
+        return plan
+
+    @app.get("/composer/objectives/{objective_id}/tasks")
+    async def composer_get_tasks(objective_id: str, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        return {"tasks": composer.get_tasks(objective_id)}
+
+    @app.get("/composer/objectives/{objective_id}/timeline")
+    async def composer_get_timeline(objective_id: str, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        return {"events": composer.get_timeline(objective_id)}
+
+    @app.get("/composer/objectives/{objective_id}/report")
+    async def composer_get_report(objective_id: str, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        report = composer.get_report(objective_id)
+        if not report:
+            raise HTTPException(404, "Report not found")
+        return report
+
+    @app.get("/composer/objectives/{objective_id}/report/html")
+    async def composer_get_report_html(objective_id: str, request: Request):
+        import os
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        report = composer.get_report(objective_id)
+        if not report:
+            raise HTTPException(404, "Report not found")
+        html_path = report.get("html_artifact_ref", "")
+        if not html_path or not os.path.isfile(html_path):
+            raise HTTPException(404, "HTML report file not found")
+        return FileResponse(html_path, media_type="text/html")
+
+    @app.get("/composer/objectives/{objective_id}/report/json")
+    async def composer_get_report_json(objective_id: str, request: Request):
+        import os
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        report = composer.get_report(objective_id)
+        if not report:
+            raise HTTPException(404, "Report not found")
+        json_path = report.get("json_artifact_ref", "")
+        if not json_path or not os.path.isfile(json_path):
+            raise HTTPException(404, "JSON report file not found")
+        return FileResponse(json_path, media_type="application/json")
+
+    @app.post("/composer/objectives/{objective_id}/start")
+    async def composer_start(objective_id: str, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        return await composer.start_objective(objective_id)
+
+    @app.post("/composer/objectives/{objective_id}/pause")
+    async def composer_pause(objective_id: str, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        return await composer.pause_objective(objective_id)
+
+    @app.post("/composer/objectives/{objective_id}/resume")
+    async def composer_resume(objective_id: str, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        return await composer.resume_objective(objective_id)
+
+    @app.post("/composer/objectives/{objective_id}/cancel")
+    async def composer_cancel(objective_id: str, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        return await composer.cancel_objective(objective_id)
+
+    @app.post("/composer/objectives/{objective_id}/reconcile")
+    async def composer_reconcile(objective_id: str, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        return await composer.reconcile_objective(objective_id)
+
+    @app.post("/composer/objectives/{objective_id}/steer")
+    async def composer_steer(objective_id: str, body: ComposerSteerRequest, request: Request):
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        return await composer.steer_objective(objective_id, body.guidance)
+
+    @app.post("/composer/objectives/{objective_id}/dev/force-complete")
+    async def composer_dev_force_complete(objective_id: str, request: Request):
+        """DEV-ONLY: drive mock gateway tasks through completion,
+        verification, integration, report generation, and objective
+        completion. Used by ``scripts/e2e-composer-local.sh``.
+
+        Disabled when the server is running in production
+        (``cfg.environment == "production"``) or when a non-mock
+        Agents Gateway client is configured.
+        """
+        composer = getattr(app.state, "composer", None)
+        if composer is None:
+            raise HTTPException(503, "Composer not enabled")
+        # Double gate — the ComposerService.force_completion method
+        # also refuses to run when the configured env is not test/dev
+        # or when the downstream agents gateway is not a mock client.
+        result = await composer.force_completion(objective_id)
+        if isinstance(result, dict) and result.get("error"):
+            # Surface a 403 for disallowed attempts — never allow
+            # production to silently no-op.
+            raise HTTPException(403, result["error"])
+        return result
+
     # ── MCP server mount ────────────────────────────────────────────────
     # The MCP sub-app was built earlier in create_app so its lifespan could
     # be propagated to the parent FastAPI app (FastMCP requires this for
@@ -614,10 +911,18 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
 
 def run_server(cfg: ConductorConfig) -> None:
     setup_logging(cfg.observability.log_level, cfg.observability.log_format)
-    logger.info("boot env=%s auth=%s port=%s", cfg.environment, cfg.auth.mode, cfg.service.port)
+    logger.info("boot env=%s auth=%s port=%s", cfg.environment, cfg.auth.mode, cfg.service.port, extra={"composer_enabled": cfg.composer.enabled, "composer_test_mode": cfg.composer.test_mode})
 
     app = create_app(cfg)
 
     cfg.auth.mode = cfg.auth.mode  # suppress unused warning — auth is wired in create_app
 
     uvicorn.run(app, host=cfg.service.host, port=cfg.service.port, log_level=cfg.observability.log_level.lower())
+
+
+if __name__ == "__main__":
+    # ``python -m conductor.server`` boots with the configured env vars
+    # (CONDUCTOR_ENVIRONMENT, CONDUCTOR_COMPOSER_TEST_MODE, etc.) without
+    # needing the CLI/Typer entrypoint — useful for dev/E2E runs.
+    _cfg = load_config()
+    run_server(_cfg)

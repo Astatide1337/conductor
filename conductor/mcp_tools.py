@@ -15,7 +15,8 @@ def _json(obj) -> str:
 
 
 def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway_client,
-                             metrics=None, gateway_registry=None, mcp_gateway_client=None):
+                             metrics=None, gateway_registry=None, mcp_gateway_client=None,
+                             composer_service=None):
     """Register all conductor MCP tools on a FastMCP server instance."""
 
     @mcp.tool()
@@ -463,3 +464,104 @@ def register_conductor_tools(mcp, cfg, storage, breakers, skills_client, gateway
         chronological = [e.model_dump() for e in reversed(events)]
         return _json({"objective_id": objective_id, "count": len(chronological),
                       "events": chronological})
+
+    # ── Composer MCP tools ────────────────────────────────────────────────
+
+    if composer_service is not None:
+
+        @mcp.tool()
+        async def composer_submit_spec(
+            title: str,
+            spec: str,
+            repository_json: str = "{}",
+            auto_start: bool = True,
+        ) -> str:
+            """Submit a finalized specification to Composer for autonomous execution."""
+            repo = json.loads(repository_json) if repository_json else {}
+            result = await composer_service.submit_specification(
+                title=title, raw_spec=spec, repository=repo, auto_start=auto_start,
+            )
+            return _json(result)
+
+        @mcp.tool()
+        async def composer_list_objectives(status: str = "", limit: int = 50, offset: int = 0) -> str:
+            """List Composer objectives."""
+            objs = composer_service.list_objectives(status=status or None, limit=limit, offset=offset)
+            return _json({"objectives": objs})
+
+        @mcp.tool()
+        async def composer_get_objective(objective_id: str) -> str:
+            """Get full Composer objective state including spec and plan."""
+            obj = composer_service.get_objective(objective_id)
+            return _json(obj or {"error": "not found"})
+
+        @mcp.tool()
+        async def composer_get_plan(objective_id: str) -> str:
+            """Get the Composer plan for an objective."""
+            plan = composer_service.get_plan(objective_id)
+            return _json(plan or {"error": "not found"})
+
+        @mcp.tool()
+        async def composer_get_status(objective_id: str) -> str:
+            """Get concise Composer objective status with progress summary."""
+            obj = composer_service.get_objective(objective_id) or {}
+            spec = obj.get("composer_spec", {})
+            plan = obj.get("composer_plan", {})
+            tasks = plan.get("plan_tasks", [])
+            completed = sum(1 for t in tasks if t.get("status") == "completed")
+            running = sum(1 for t in tasks if t.get("status") in ("running", "dispatching"))
+            pending = sum(1 for t in tasks if t.get("status") == "pending")
+            return _json({
+                "objective_id": objective_id,
+                "status": spec.get("status", "unknown"),
+                "progress": {
+                    "total_tasks": len(tasks),
+                    "completed": completed,
+                    "running": running,
+                    "pending": pending,
+                },
+                "blocked_external": spec.get("status") == "blocked_external",
+                "report_available": bool(composer_service.get_report(objective_id)),
+            })
+
+        @mcp.tool()
+        async def composer_get_timeline(objective_id: str, limit: int = 100) -> str:
+            """Get the Composer event timeline for an objective."""
+            events = composer_service.get_timeline(objective_id)
+            return _json({"objective_id": objective_id, "events": events})
+
+        @mcp.tool()
+        async def composer_get_report(objective_id: str) -> str:
+            """Get the Composer review report for an objective."""
+            report = composer_service.get_report(objective_id)
+            return _json(report or {"error": "not found"})
+
+        @mcp.tool()
+        async def composer_pause(objective_id: str) -> str:
+            """Pause a Composer objective."""
+            result = await composer_service.pause_objective(objective_id)
+            return _json(result or {"error": "not found"})
+
+        @mcp.tool()
+        async def composer_resume(objective_id: str) -> str:
+            """Resume a Composer objective."""
+            result = await composer_service.resume_objective(objective_id)
+            return _json(result)
+
+        @mcp.tool()
+        async def composer_cancel(objective_id: str) -> str:
+            """Cancel a Composer objective."""
+            result = await composer_service.cancel_objective(objective_id)
+            return _json(result or {"error": "not found"})
+
+        @mcp.tool()
+        async def composer_reconcile(objective_id: str) -> str:
+            """Trigger Composer reconciliation for an objective."""
+            result = await composer_service.reconcile_objective(objective_id)
+            return _json(result)
+
+        @mcp.tool()
+        async def composer_steer(objective_id: str, guidance: str) -> str:
+            """Add steering guidance to an active Composer objective."""
+            result = await composer_service.steer_objective(objective_id, guidance)
+            return _json(result)

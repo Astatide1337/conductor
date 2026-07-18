@@ -12,6 +12,8 @@ Any MCP-compatible cockpit (Claude / ChatGPT / CLI / future UI)
        v
 Conductor ─── single MCP + REST surface (the hub)
        |
+       +--> Composer (planning + supervision engine inside Conductor)
+       |
    +---+---+---+---+---------+
    |   |   |   |   |         |
    v   v   v   v   v         v
@@ -23,12 +25,19 @@ probes, capability catalog, dispatch / reconciliation, and the unified
 objective timeline. Cockpits ask "What happened with objective X?" and
 get one answer — they never need to inspect each gateway directly.
 
+**Composer** is the spec-to-verified-execution engine inside Conductor.
+It normalizes specifications, creates executable task graphs, dispatches
+tasks in parallel through Agents Gateway, answers agent interactions
+autonomously, integrates completed branches, verifies completion,
+and produces HTML/JSON review reports.
+
 ## Responsibility boundaries
 
 | Component | Owns |
 |---|---|
 | **Conductor** | Objectives, task graph, planner decisions, approvals, policy, circuit breakers, cost accounting, dispatch coordination, status aggregation, reconciliation, MCP cockpit surface, **Gateway Hub** (registry, health probes, capability catalog, unified timeline) |
-| **Agents Gateway** | Agent/task execution, runtime adapters, background workers, task events, task artifacts, runtime sandboxing |
+| **Composer** | Spec-to-verified-execution engine inside Conductor: spec normalization, executable task graph (DAG), harness/skill/capability assignment, parallel dispatch, agent interaction answering, integration branch creation, final verification, HTML/JSON reports |
+| **Agents Gateway** | Agent/task execution, runtime adapters, background workers, task events, task artifacts, runtime sandboxing, isolated worktrees, tmux-backed harness sessions |
 | **Skills Gateway** | Skills, methodology, skill metadata, skill reading |
 | **MCP Gateway** | External MCP tools / connectors (GitHub, Drive, Calendar, mail). Conductor treats MCP Gateway as one of several downstream capability providers — not as its parent. |
 | **wiki-mcp** | Durable memory, project context, decision logs |
@@ -53,9 +62,29 @@ conductor/
                     (skills gate + capabilities gate, both pre-transition)
   metrics.py      — Prometheus metrics registry (incl. gateway hub gauges)
   logging.py      — structured JSON logging with contextvars
-  mcp_tools.py    — 23 MCP cockpit tools (objective/task/approval +
-                    gateway-hub: list/check/status/capabilities/timeline)
-  gateways/       — Gateway Hub package
+mcp_tools.py    — 35 MCP cockpit tools (objective/task/approval +
+                     gateway-hub: list/check/status/capabilities/timeline +
+                     composer: submit/list/get/plan/status/timeline/report/
+                     pause/resume/cancel/reconcile/steer)
+  composer/       — Composer spec-to-verified-execution engine
+    models.py     — ComposerSpec, ComposerPlan, TaskNode, IntegrationNode,
+                    ComposerReport, InteractionDecision, + LLM result models
+    storage.py    — 5 SQLite tables (composer_specs, composer_plans,
+                    composer_plan_tasks, composer_interaction_decisions,
+                    composer_reports)
+    service.py    — High-level ComposerService (submit, start, reconcile,
+                    lifecycle, steering)
+    context.py    — Project/spec/gateway/skill context aggregation
+    planner.py    — Plan validation (DAG cycle detection, harness/skill/
+                    capability/file-overlap checks)
+    scheduler.py  — Dependency-aware parallel task dispatch
+    supervisor.py — Background supervision loop (periodic reconciliation)
+    interactions.py — Pending interaction discovery and automated answering
+    integration.py — Integration task dispatch and branch reconciliation
+    verification.py — Completion criteria (VerificationContract)
+    reports.py   — HTML + JSON objective-level review reports (secrets redacted)
+    prompts.py   — Versioned LLM prompt templates
+    llm.py       — LLM provider abstraction (Fake/Http clients + JSON validation)
     models.py     — GatewayConfig + GatewayStatus
     registry.py   — GatewayRegistry + build_default_registry(cfg)
     health.py     — check_gateway_health / check_all_gateways
@@ -86,6 +115,16 @@ conductor/
 | `events` | Append-only audit trail |
 | `planner_turns` | Planner invocation records |
 | `cost_ledger` | Cost and token tracking |
+
+13 SQLite tables total (including Composer tables):
+
+| Table | Purpose |
+|---|---|
+| `composer_specs` | Composer specifications with status lifecycle |
+| `composer_plans` | Task graphs (DAG) with validation/activation state |
+| `composer_plan_tasks` | Plan nodes linking to Conductor tasks and Agents Gateway tasks |
+| `composer_interaction_decisions` | Automated agent interaction answers |
+| `composer_reports` | Final HTML/JSON report references |
 
 ### State machines
 
