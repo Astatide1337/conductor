@@ -211,7 +211,7 @@ class HttpMcpGatewayClient(BaseMcpGatewayClient):
             McpTool(
                 name=t.get("name", ""),
                 description=t.get("description", ""),
-                input_schema=t.get("input_schema", {}) or {},
+                input_schema=t.get("input_schema") or t.get("inputSchema") or {},
             )
             for t in tools_list
         ]

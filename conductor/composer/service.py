@@ -495,23 +495,57 @@ class ComposerService:
                             )
                             if result:
                                 existing_meta = pt.get("metadata", {}) or {}
-                                # Preserve the original planned goal separately from
-                                # the appended failure context so restarts never
-                                # overwrite the source of truth.  The durable
-                                # ``goal`` SQLite column already carries the
-                                # exact planned text.
-                                merged = {**existing_meta,
-                                    "attempt": new_attempt,
-                                    "session_id": session_id or "",
-                                    "failure_context": failure_ctx[:500] if failure_ctx else "",
-                                }
-                                self.storage.update_plan_task(
-                                    pt["id"],
-                                    status="running",
-                                    agents_gateway_task_id=result.get("gw_task_id"),
-                                    metadata=merged,
-                                )
-                                actions.append(f"restarted {pt['node_key']} (attempt {new_attempt})")
+                                # Detect partial creation: create_harness_task succeeded
+                                # but run_task failed.  The new GW task was already
+                                # cancelled — preserve both IDs for audit trail.
+                                if result.get("run_failed"):
+                                    attempt_history = existing_meta.get("attempt_history", [])
+                                    if not isinstance(attempt_history, list):
+                                        attempt_history = []
+                                    attempt_history.append({
+                                        "attempt": attempts,
+                                        "gw_task_id": gw_task_id,
+                                        "session_id": session_id or "",
+                                    })
+                                    partial_meta = {
+                                        **existing_meta,
+                                        "attempt": new_attempt,
+                                        "session_id": session_id or "",
+                                        "failure_context": failure_ctx[:500] if failure_ctx else "",
+                                        "attempt_history": attempt_history,
+                                        "partial_gw_task_id": result.get("partial_gw_task_id"),
+                                        "last_restart_failed": True,
+                                        "last_restart_error": "run_task_failed_after_create",
+                                        "last_restart_at": _now_iso(),
+                                    }
+                                    self.storage.update_plan_task(
+                                        pt["id"],
+                                        status="blocked_external",
+                                        agents_gateway_task_id=gw_task_id,
+                                        metadata=partial_meta,
+                                    )
+                                    composer_emit(self.conductor_storage or self.storage,
+                                                  "composer.task_restart_failed",
+                                                  "run_task failed after create_harness_task",
+                                                  objective_id=objective_id,
+                                                  task_id=gw_task_id,
+                                                  payload={"node_key": pt.get("node_key", ""),
+                                                           "new_gw_task_id": result.get("partial_gw_task_id"),
+                                                           "partial_creation": True})
+                                    actions.append(f"blocked {pt['node_key']} (run_task failed after create, attempt {new_attempt})")
+                                else:
+                                    merged = {**existing_meta,
+                                        "attempt": new_attempt,
+                                        "session_id": session_id or "",
+                                        "failure_context": failure_ctx[:500] if failure_ctx else "",
+                                    }
+                                    self.storage.update_plan_task(
+                                        pt["id"],
+                                        status="running",
+                                        agents_gateway_task_id=result.get("gw_task_id"),
+                                        metadata=merged,
+                                    )
+                                    actions.append(f"restarted {pt['node_key']} (attempt {new_attempt})")
                             else:
                                 # Dispatch refused — mark blocked_external, preserve
                                 # old GW task ID and evidence so the operator can

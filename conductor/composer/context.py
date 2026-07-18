@@ -142,12 +142,13 @@ def build_composer_context(
     if repo_path and os.path.isdir(repo_path):
         project_context = _build_project_context(repo_path)
     elif repo_url and mcp_gateway_client:
-        try:
-            project_context = _build_remote_context(mcp_gateway_client, repo_url)
-        except Exception as exc:
-            logger.warning("Failed to fetch remote repo context: %s", exc)
-            project_context["repo_url"] = repo_url
-            project_context["access_error"] = str(exc)
+            ref = repo_info.get("base_branch", "") if isinstance(repo_info, dict) else ""
+            try:
+                project_context = _build_remote_context(mcp_gateway_client, repo_url, ref)
+            except Exception as exc:
+                logger.warning("Failed to fetch remote repo context: %s", exc)
+                project_context["repo_url"] = repo_url
+                project_context["access_error"] = str(exc)
     elif spec and spec.get("normalized_spec", {}).get("repository", {}).get("url"):
         project_context["repo_url"] = spec["normalized_spec"]["repository"]["url"]
 
@@ -209,7 +210,7 @@ def _build_project_context(repo_path: str) -> dict:
     return ctx
 
 
-def _build_remote_context(mcp_client, repo_url: str) -> dict:
+def _build_remote_context(mcp_client, repo_url: str, ref: str = "") -> dict:
     """Fetch bounded repo context via MCP Gateway using list_tools/call_tool.
 
     Selects tools by contract — inspects discovered tools' names,
@@ -266,7 +267,7 @@ def _build_remote_context(mcp_client, repo_url: str) -> dict:
     if file_tool is not None:
         for filename in files_to_fetch:
             try:
-                args = _build_file_tool_args(file_tool, owner, repo, filename)
+                args = _build_file_tool_args(file_tool, owner, repo, filename, ref)
                 result = mcp_client.call_tool(file_tool.name, args)
                 content = _extract_content_from_result(result)
                 if content:
@@ -286,7 +287,7 @@ def _build_remote_context(mcp_client, repo_url: str) -> dict:
     # Tree listing via the dedicated tool, never the file-content tool.
     if tree_tool is not None:
         try:
-            args = _build_tree_tool_args(tree_tool, owner, repo)
+            args = _build_tree_tool_args(tree_tool, owner, repo, ref)
             result = mcp_client.call_tool(tree_tool.name, args)
             tree = _extract_content_from_result(result)
             if tree:
@@ -480,43 +481,52 @@ def _select_tree_listing_tool(tools) -> object | None:
     return None
 
 
-def _build_file_tool_args(tool, owner: str, repo: str, path: str) -> dict:
+def _build_file_tool_args(tool, owner: str, repo: str, path: str, ref: str = "") -> dict:
     """Build the call_tool argument dict for a file-content tool.
 
     Honors the tool's input schema — only includes keys that the schema
     declares.  Falls back to ``owner``/``repo``/``path`` if the schema
-    is unavailable (older MCP gateways).
+    is unavailable (older MCP gateways).  ``ref`` is only included when
+    both nonempty AND declared in the schema.
     """
     schema = _tool_input_schema(tool)
     if not schema:
-        return {"owner": owner, "repo": repo, "path": path}
+        base = {"owner": owner, "repo": repo, "path": path}
+        if ref:
+            base["ref"] = ref
+        return base
     props = schema.get("properties", {})
     args: dict = {}
     for key, source in (("owner", owner), ("repo", repo), ("path", path),
                         ("repository", repo), ("file_path", path),
                         ("filepath", path),
                         ("repository_full_name", f"{owner}/{repo}"),
-                        ("repo_full_name", f"{owner}/{repo}"),
-                        ("ref", "")):
+                        ("repo_full_name", f"{owner}/{repo}")):
         if key in props:
             args[key] = source
+    if ref and "ref" in props:
+        args["ref"] = ref
     return args
 
 
-def _build_tree_tool_args(tool, owner: str, repo: str) -> dict:
+def _build_tree_tool_args(tool, owner: str, repo: str, ref: str = "") -> dict:
     """Build the call_tool argument dict for a tree-listing tool."""
     schema = _tool_input_schema(tool)
     if not schema:
-        return {"owner": owner, "repo": repo}
+        base = {"owner": owner, "repo": repo}
+        if ref:
+            base["ref"] = ref
+        return base
     props = schema.get("properties", {})
     args: dict = {}
     for key, source in (("owner", owner), ("repo", repo),
                         ("repository", repo),
                         ("repository_full_name", f"{owner}/{repo}"),
-                        ("repo_full_name", f"{owner}/{repo}"),
-                        ("ref", "")):
+                        ("repo_full_name", f"{owner}/{repo}")):
         if key in props:
             args[key] = source
+    if ref and "ref" in props:
+        args["ref"] = ref
     return args
 
 

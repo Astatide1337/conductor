@@ -1554,3 +1554,535 @@ class TestRealArtifactApiContract:
                 blob = client.download_artifact(task.id, "result.json")
                 assert blob == b'{"commit_sha": "deadbeef"}'
             client.close()
+
+
+# ── 18. Report HTTP routes (fix #4 from aa7777b) ──────────────────────────
+
+
+class TestReportHttpRoutes:
+    """GET /report/html and /report/json logic: files exist → served, missing → not found."""
+
+    def test_report_html_artifact_ref_points_to_file(self, setup):
+        """Report created with a real html_artifact_ref stores the path."""
+        import os
+        svc, gw, cs, cps, d, db = setup
+        report_dir = svc.config.report_dir
+        os.makedirs(report_dir, exist_ok=True)
+
+        html_path = os.path.join(report_dir, "test-report.html")
+        json_path = os.path.join(report_dir, "test-report.json")
+        with open(html_path, "w") as f:
+            f.write("<html><body>Test Report</body></html>")
+        with open(json_path, "w") as f:
+            f.write('{"objective_id": "obj1"}')
+
+        objective_id = "test-html-ref"
+        cps.create_report(objective_id, "completed",
+                          html_artifact_ref=html_path,
+                          json_artifact_ref=json_path)
+        r = svc.get_report(objective_id)
+        assert r is not None
+        assert r.get("html_artifact_ref") == html_path
+        assert os.path.isfile(r["html_artifact_ref"]), "HTML artifact ref must be a real file"
+
+    def test_report_missing_file_is_detectable(self, setup):
+        """Report with nonexistent artifact ref can be detected via os.path.isfile."""
+        import os
+        svc, gw, cs, cps, d, db = setup
+
+        objective_id = "test-missing-ref"
+        cps.create_report(objective_id, "completed",
+                          html_artifact_ref="/nonexistent/report.html",
+                          json_artifact_ref="/nonexistent/report.json")
+        r = svc.get_report(objective_id)
+        assert r is not None
+        html_ref = r.get("html_artifact_ref", "")
+        assert html_ref
+        assert not os.path.isfile(html_ref), "Missing file must not exist on disk"
+        json_ref = r.get("json_artifact_ref", "")
+        assert json_ref
+        assert not os.path.isfile(json_ref)
+
+
+# ── 19. Production localhost gateway client selection (fix #6 from aa7777b) ──
+
+
+class TestGatewayClientLocalhostProduction:
+    """Production + localhost URL → real HTTP client (not mock)."""
+
+    def test_mcp_gateway_production_localhost_uses_http(self):
+        """When environment=production and URL is localhost, HttpMcpGatewayClient is built."""
+        from conductor.server import _build_mcp_gateway_client, _is_localhost_url
+        from conductor.config import ConductorConfig, McpGatewayClientConfig
+
+        cfg = ConductorConfig(environment="production")
+        cfg.composer.enabled = True
+        cfg.composer.test_mode = False
+        cfg.mcp_gateway = McpGatewayClientConfig(url="http://localhost:8095",
+                                                  auth_mode="internal_only",
+                                                  internal_token="test-token")
+
+        client = _build_mcp_gateway_client(cfg)
+        from conductor.clients.mcp_gateway import HttpMcpGatewayClient
+        assert client is not None
+        assert isinstance(client, HttpMcpGatewayClient), (
+            f"expected HttpMcpGatewayClient, got {type(client).__name__}")
+
+    def test_mcp_gateway_dev_localhost_uses_mock(self):
+        """When environment=test/dev and URL is localhost, MockMcpGatewayClient is built."""
+        from conductor.server import _build_mcp_gateway_client
+        from conductor.config import ConductorConfig, McpGatewayClientConfig
+
+        cfg = ConductorConfig(environment="test")
+        cfg.composer.enabled = True
+        cfg.composer.test_mode = True
+        cfg.mcp_gateway = McpGatewayClientConfig(url="http://localhost:8095",
+                                                  auth_mode="internal_only",
+                                                  internal_token="test-token")
+
+        client = _build_mcp_gateway_client(cfg)
+        from conductor.clients.mcp_gateway import MockMcpGatewayClient
+        assert client is not None
+        assert isinstance(client, MockMcpGatewayClient), (
+            f"expected MockMcpGatewayClient, got {type(client).__name__}")
+
+    def test_skills_gateway_production_localhost_uses_http(self):
+        """When environment=production and URL is localhost, HttpSkillsGatewayClient is built."""
+        from conductor.server import _build_skills_client
+        from conductor.config import ConductorConfig, SkillsGatewayClientConfig
+
+        cfg = ConductorConfig(environment="production")
+        cfg.composer.enabled = True
+        cfg.composer.test_mode = False
+        cfg.skills_gateway = SkillsGatewayClientConfig(url="http://localhost:8096",
+                                                        auth_mode="internal_token",
+                                                        internal_token="test-token")
+
+        client = _build_skills_client(cfg)
+        from conductor.clients.skills_gateway import HttpSkillsGatewayClient
+        assert client is not None
+        assert isinstance(client, HttpSkillsGatewayClient), (
+            f"expected HttpSkillsGatewayClient, got {type(client).__name__}")
+
+    def test_skills_gateway_dev_localhost_returns_none(self):
+        """When environment=test/dev and URL is localhost, _build_skills_client returns None."""
+        from conductor.server import _build_skills_client
+        from conductor.config import ConductorConfig, SkillsGatewayClientConfig
+
+        cfg = ConductorConfig(environment="test")
+        cfg.composer.enabled = True
+        cfg.composer.test_mode = True
+        cfg.skills_gateway = SkillsGatewayClientConfig(url="http://localhost:8096",
+                                                        auth_mode="internal_token",
+                                                        internal_token="test-token")
+
+        client = _build_skills_client(cfg)
+        assert client is None, (
+            f"dev + localhost skills gateway should return None, got {type(client).__name__ if client else None}")
+
+
+# ── 20. inputSchema normalization + ref propagation ───────────────────────
+
+
+class TestMcpInputSchemaAndRef:
+    """inputSchema (camelCase) normalization + ref propagation through context."""
+
+    def test_list_tools_normalizes_input_schema_camelcase(self):
+        """HTTP response with ``inputSchema`` (not ``input_schema``) still populates McpTool."""
+        from conductor.clients.mcp_gateway import McpTool
+
+        # Pre-fix old code: only looked at input_schema key
+        old_code = lambda t: McpTool(
+            name=t.get("name", ""),
+            description=t.get("description", ""),
+            input_schema=t.get("input_schema", {}) or {},
+        )
+        # Post-fix new code: normalizes both input_schema and inputSchema
+        new_fixed = lambda t: McpTool(
+            name=t.get("name", ""),
+            description=t.get("description", ""),
+            input_schema=t.get("input_schema") or t.get("inputSchema") or {},
+        )
+
+        tool_data = {
+            "name": "git.read_file",
+            "description": "Read a file from the repo",
+            "inputSchema": {  # camelCase — MCP spec canonical form
+                "type": "object",
+                "properties": {"path": {"type": "string"},
+                               "ref": {"type": "string"}},
+            },
+        }
+
+        old_result = old_code(tool_data)
+        assert old_result.input_schema == {}, (
+            "pre-fix: input_schema key absent → discarded to {}")
+        new_result = new_fixed(tool_data)
+        assert new_result.input_schema != {}, (
+            "post-fix: inputSchema must be normalised into input_schema")
+        assert "path" in new_result.input_schema.get("properties", {})
+
+    def test_build_file_tool_args_repository_full_name(self):
+        """When schema declares ``repository_full_name``, it receives owner/repo."""
+        from conductor.composer.context import _build_file_tool_args
+
+        tool = MagicMock()
+        tool.input_schema = {
+            "type": "object",
+            "properties": {
+                "repository_full_name": {"type": "string"},
+                "ref": {"type": "string"},
+            },
+            "required": ["repository_full_name"],
+        }
+        # Simulate _tool_input_schema returning the schema
+        tool.get.return_value = None  # not a dict
+
+        args = _build_file_tool_args(tool, "owner", "repo1", "README.md", ref="develop")
+        assert args.get("repository_full_name") == "owner/repo1"
+        assert args.get("ref") == "develop"
+
+    def test_build_tree_tool_args_repo_full_name(self):
+        """When schema declares ``repo_full_name``, it receives owner/repo."""
+        from conductor.composer.context import _build_tree_tool_args
+
+        tool = MagicMock()
+        tool.input_schema = {
+            "type": "object",
+            "properties": {
+                "repo_full_name": {"type": "string"},
+                "ref": {"type": "string"},
+            },
+        }
+        args = _build_tree_tool_args(tool, "own", "repo", ref="develop")
+        assert args.get("repo_full_name") == "own/repo"
+        assert args.get("ref") == "develop"
+
+    def test_ref_omitted_when_empty(self):
+        """``ref`` is NOT included when empty and schema declares it."""
+        from conductor.composer.context import _build_file_tool_args
+
+        tool = MagicMock()
+        tool.input_schema = {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repo": {"type": "string"},
+                "path": {"type": "string"},
+                "ref": {"type": "string"},
+            },
+            "required": ["owner", "repo", "path"],
+        }
+        args = _build_file_tool_args(tool, "owner", "repo", "README.md", ref="")
+        assert "ref" not in args, (
+            f"empty ref MUST NOT be included; got args={args}")
+
+    def test_ref_included_when_nonempty(self):
+        """Non-empty ``ref`` is included when schema declares it."""
+        from conductor.composer.context import _build_file_tool_args
+
+        tool = MagicMock()
+        tool.input_schema = {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repo": {"type": "string"},
+                "path": {"type": "string"},
+                "ref": {"type": "string"},
+            },
+        }
+        args = _build_file_tool_args(tool, "owner", "repo", "README.md", ref="develop")
+        assert args.get("ref") == "develop"
+
+    def test_schema_has_path_param_matches_file_path(self):
+        """``_schema_has_path_param`` matches ``file_path`` and ``filepath`` properties."""
+        from conductor.composer.context import _schema_has_path_param
+
+        # Tool with file_path property
+        tool_fp = MagicMock()
+        tool_fp.input_schema = {
+            "type": "object",
+            "properties": {"owner": {"type": "string"}, "file_path": {"type": "string"}},
+        }
+        assert _schema_has_path_param(tool_fp), "file_path must trigger has_path_param"
+
+        # Tool with filepath property
+        tool_fph = MagicMock()
+        tool_fph.input_schema = {
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "filepath": {"type": "string"}},
+        }
+        assert _schema_has_path_param(tool_fph), "filepath must trigger has_path_param"
+
+        # Tool with only path property
+        tool_p = MagicMock()
+        tool_p.input_schema = {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+        }
+        assert _schema_has_path_param(tool_p)
+
+        # Tool with none of those
+        tool_n = MagicMock()
+        tool_n.input_schema = {
+            "type": "object",
+            "properties": {"search": {"type": "string"}},
+        }
+        assert not _schema_has_path_param(tool_n)
+
+
+# ── 21. Failed-task restart failure-safe (fix #7 from aa7777b) + partial creation ──
+
+
+class TestFailedTaskRestartFailureSafe:
+    """Normal reconcile restart dispatch refusal → blocked_external, not permanent fail."""
+
+    @pytest.mark.asyncio
+    async def test_ordinary_restart_refusal_marks_blocked_external(self, setup):
+        """Restart dispatch returns None → plan task becomes blocked_external."""
+        svc, gw, cs, cps, d, db = setup
+        r = await svc.submit_specification(
+            title="Restart refusal", raw_spec="Build x", auto_start=True)
+        obj_id = r["objective_id"]
+        await svc.start_objective(obj_id)
+
+        plan = cps.get_plan_by_objective(obj_id)
+        impl = next((t for t in plan["plan_tasks"]
+                     if t.get("agents_gateway_task_id")
+                     and t.get("node_key") != "integration"), None)
+        assert impl is not None
+        gw_id = impl["agents_gateway_task_id"]
+
+        # Fail the task
+        gw.fail_task(gw_id)
+
+        # Patch the scheduler's restart_failed_task to return None
+        # (simulating dispatch refusal)
+        original = svc.scheduler.restart_failed_task
+
+        def refuse_restart(*a, **kw):
+            return None
+
+        svc.scheduler.restart_failed_task = refuse_restart
+        try:
+            await svc.reconcile_objective(obj_id)
+        finally:
+            svc.scheduler.restart_failed_task = original
+
+        plan_after = cps.get_plan_by_objective(obj_id)
+        pt = next(t for t in plan_after["plan_tasks"]
+                   if t["id"] == impl["id"])
+        assert pt["status"] == "blocked_external", (
+            f"dispatch refusal must mark blocked_external, got {pt['status']}")
+        assert pt["agents_gateway_task_id"] == gw_id, (
+            "old GW task ID must be preserved for evidence inspection")
+        meta = pt.get("metadata", {})
+        assert meta.get("last_restart_failed") is True
+
+    @pytest.mark.asyncio
+    async def test_partial_creation_run_failure_preserves_both_gw_ids(self, setup):
+        """create_harness_task succeeds, run_task fails → partial_creation preserved,
+        blocked_external, both GW IDs tracked."""
+        svc, gw, cs, cps, d, db = setup
+        r = await svc.submit_specification(
+            title="Partial creation", raw_spec="Build x", auto_start=True)
+        obj_id = r["objective_id"]
+        await svc.start_objective(obj_id)
+
+        plan = cps.get_plan_by_objective(obj_id)
+        impl = next((t for t in plan["plan_tasks"]
+                     if t.get("agents_gateway_task_id")
+                     and t.get("node_key") != "integration"), None)
+        assert impl is not None
+        old_gw_id = impl["agents_gateway_task_id"]
+        plan_task_id = impl["id"]
+
+        gw.fail_task(old_gw_id)
+
+        # Patch _dispatch_one to return a partial-creation result
+        # without touching the real GW at all — the reconcile code
+        # just sees this returned dict and handles it accordingly.
+        partial_result = {"node_id": impl["node_key"],
+                          "gw_task_id": None,
+                          "partial_gw_task_id": "phantom-gw-999",
+                          "run_failed": True}
+
+        with patch.object(svc.scheduler, "_dispatch_one", return_value=partial_result):
+            await svc.reconcile_objective(obj_id)
+
+        plan_after = cps.get_plan_by_objective(obj_id)
+        pt = next(t for t in plan_after["plan_tasks"]
+                   if t["id"] == plan_task_id)
+        assert pt["status"] == "blocked_external", (
+            f"partial creation must result in blocked_external, got {pt['status']}")
+        assert pt["agents_gateway_task_id"] == old_gw_id, (
+            "old GW task ID must be preserved as evidence")
+        meta = pt.get("metadata", {})
+        assert meta.get("partial_gw_task_id") == "phantom-gw-999", (
+            "partial_gw_task_id must be recorded so the phantom task is tracked")
+        assert meta.get("last_restart_failed") is True
+
+
+# ── 22. Result artifact lookup by artifact ID via GW artifact list ────────
+
+
+class TestResultArtifactLookup:
+    """Agent Gateway contract: list artifacts, find by name, download by artifact ID."""
+
+    def test_artifact_lookup_via_list_then_download(self):
+        """The correct sequence is:
+        1. GET /tasks/{task_id}/artifacts → list of artifacts
+        2. find artifact where name == 'result.json', extract its id
+        3. GET /artifacts/{id}?view=true → download artifact
+        """
+        from conductor.config import AgentsGatewayClientConfig
+        from conductor.clients.agents_gateway import HttpAgentsGatewayClient
+
+        cfg = AgentsGatewayClientConfig(url="http://localhost:8092")
+        client = HttpAgentsGatewayClient(cfg, max_retries=0)
+
+        result_artifact_id = "art_result_789"
+        result_json_blob = json.dumps({
+            "git": {"pushed": True, "branch": "integration/test", "sha": "abc123"},
+            "status": "ok",
+        }).encode()
+
+        with patch.object(client, "_request") as mock_req:
+            class FakeResponse:
+                def __init__(self, content, status=200):
+                    self.status_code = status
+                    self.content = content if isinstance(content, bytes) else content.encode()
+                    self.text = content if isinstance(content, str) else content.decode()
+                    self.request = MagicMock()
+                    self.request.url = "http://mock/"
+
+                @property
+                def is_success(self):
+                    return self.status_code < 400
+
+                def json(self):
+                    return json.loads(self.content)
+
+            # Call 1: list task artifacts
+            mock_req.side_effect = [
+                FakeResponse(json.dumps({"artifacts": [
+                    {"id": "art_session_log", "name": "session.log",
+                     "path": "/tmp/session.log", "size_bytes": 500,
+                     "created_at": "2024-01-01", "task_id": "task_xyz"},
+                    {"id": result_artifact_id, "name": "result.json",
+                     "path": "/tmp/result.json", "size_bytes": 200,
+                     "created_at": "2024-01-01", "task_id": "task_xyz"},
+                ]}).encode()),
+                # Call 2: download artifact by id
+                FakeResponse(result_json_blob),
+            ]
+
+            blob = client.download_artifact("task_xyz", "result.json")
+            assert blob == result_json_blob
+            assert mock_req.call_count == 2
+
+            # First call: list artifacts for task
+            call1 = mock_req.call_args_list[0]
+            assert call1.args[0] == "GET"
+            assert "/tasks/task_xyz/artifacts" in call1.args[1]
+
+            # Second call: download by artifact ID
+            call2 = mock_req.call_args_list[1]
+            assert call2.args[0] == "GET"
+            assert f"/artifacts/{result_artifact_id}?view=true" == call2.args[1], (
+                "second call must be /artifacts/{artifact_id}?view=true, "
+                f"but got {call2.args[1]}")
+
+        client.close()
+
+
+# ── 23. Disposable baseline branch construction ────────────────────────────
+
+
+class TestDisposableBaselineBranch:
+    """Unique orphan branch creation as prescribed by the live-E2E contract."""
+
+    def test_disposable_baseline_branch_isolation(self):
+        """Baseline branch is an orphan — commits on it do not share
+        history with the default branch."""
+        import subprocess, tempfile, os, time
+
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            repo_dir = os.path.join(tmp.name, "baseline-repo")
+            subprocess.run(["git", "init", "-q", repo_dir], check=True,
+                           capture_output=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@test"],
+                cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Test"],
+                cwd=repo_dir, check=True, capture_output=True)
+
+            # Create initial content on default branch (main)
+            os.makedirs(os.path.join(repo_dir, "src"))
+            with open(os.path.join(repo_dir, "README.md"), "w") as f:
+                f.write("# Normal repo")
+            with open(os.path.join(repo_dir, "src", "main.py"), "w") as f:
+                f.write("def main(): return 'hello'")
+            subprocess.run(
+                ["git", "add", "README.md", "src/main.py"],
+                cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "initial: default branch"],
+                cwd=repo_dir, check=True, capture_output=True)
+            default_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo_dir, check=True, capture_output=True,
+                text=True).stdout.strip()
+
+            # Simulate the live-E2E baseline: create an orphan branch
+            ts = int(time.time())
+            baseline_branch = f"composer-live-baseline-{ts}"
+            subprocess.run(
+                ["git", "checkout", "-q", "--orphan", baseline_branch],
+                cwd=repo_dir, check=True, capture_output=True)
+            # Orphan branch starts with no committed files — git rm to
+            # clear the index (files from previous branch are staged)
+            subprocess.run(
+                ["git", "rm", "-rfq", "."],
+                cwd=repo_dir, check=False, capture_output=True)
+
+            # Write only the add-only calculator baseline
+            os.makedirs(os.path.join(repo_dir, "calculator"))
+            with open(os.path.join(repo_dir, "calculator", "__init__.py"), "w") as f:
+                f.write("def add(a, b): return a + b")
+            with open(os.path.join(repo_dir, "calculator", "test_calculator.py"), "w") as f:
+                f.write("from calculator import add\n"
+                        "def test_add():\n"
+                        "    assert add(2, 3) == 5")
+            with open(os.path.join(repo_dir, "pyproject.toml"), "w") as f:
+                f.write("[project]\n"
+                        "name = 'calculator'\n"
+                        "version = '0.1.0'")
+
+            subprocess.run(
+                ["git", "add", "."],
+                cwd=repo_dir, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "baseline: add-only"],
+                cwd=repo_dir, check=True, capture_output=True)
+            baseline_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo_dir, check=True, capture_output=True,
+                text=True).stdout.strip()
+
+            # Baseline branch must have exactly one commit
+            log_count = subprocess.run(
+                ["git", "rev-list", "--count", "HEAD"],
+                cwd=repo_dir, check=True, capture_output=True,
+                text=True).stdout.strip()
+            assert log_count == "1", (
+                f"baseline orphan branch must have exactly 1 commit, got {log_count}")
+
+            # Baseline SHA must differ from default branch SHA
+            assert baseline_sha != default_sha, (
+                f"baseline orphan branch SHA ({baseline_sha}) must "
+                f"differ from default branch SHA ({default_sha})")
+        finally:
+            tmp.cleanup()

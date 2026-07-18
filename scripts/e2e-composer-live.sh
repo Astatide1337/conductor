@@ -28,7 +28,7 @@
 #   - import multiply and divide from that checkout
 #   - run uv run pytest -q in that checkout
 #   - keep the checkout until all assertions finish
-set -euo pipefail
+set -uo pipefail
 
 # ── Required environment ───────────────────────────────────────────────────
 REQUIRED_ENV=(
@@ -46,14 +46,21 @@ for v in "${REQUIRED_ENV[@]}"; do
 done
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
-    echo "COMPOSER LIVE E2E BLOCKED: missing ${MISSING[*]}"
     echo ""
     echo "Set these variables and re-run:"
     for v in "${MISSING[@]}"; do
         echo "  export $v=..."
     done
-    exit 2
+    _block "missing ${MISSING[*]}"
 fi
+
+# ── Validate AGW_HARNESS__AUTO_PUSH is affirmatively true ──────────────────
+case "${AGW_HARNESS__AUTO_PUSH,,}" in
+    true|1|yes) ;;
+    *)
+        _block "AGW_HARNESS__AUTO_PUSH must be true/1/yes (got '${AGW_HARNESS__AUTO_PUSH}')"
+        ;;
+esac
 
 # ── Require an Agents-Gateway-accessible repository ──────────────────────
 # Use file:// only when COMPOSER_LIVE_SHARED_VOLUME=true.
@@ -63,20 +70,17 @@ if [[ -z "${REPO_URL}" ]]; then
     if [[ "${COMPOSER_LIVE_SHARED_VOLUME:-}" == "true" ]]; then
         REPO_URL="file://${COMPOSER_LIVE_REPO_DIR:-/tmp/composer-live-repo}"
     else
-        echo "COMPOSER LIVE E2E BLOCKED: missing COMPOSER_LIVE_REPO_URL"
-        exit 2
+        _block "missing COMPOSER_LIVE_REPO_URL"
     fi
 fi
 
 # ── Prove the real LLM client is active ───────────────────────────────────
 # Require production environment and test_mode=false for the live test.
 if [[ "${CONDUCTOR_ENVIRONMENT:-}" != "production" ]]; then
-    echo "COMPOSER LIVE E2E BLOCKED: CONDUCTOR_ENVIRONMENT must be 'production' (got '${CONDUCTOR_ENVIRONMENT:-}')"
-    exit 2
+    _block "CONDUCTOR_ENVIRONMENT must be 'production' (got '${CONDUCTOR_ENVIRONMENT:-}')"
 fi
 if [[ "${CONDUCTOR_COMPOSER__TEST_MODE:-${CONDUCTOR_COMPOSER_TEST_MODE:-}}" == "true" ]]; then
-    echo "COMPOSER LIVE E2E BLOCKED: CONDUCTOR_COMPOSER__TEST_MODE must be 'false' for live E2E"
-    exit 2
+    _block "CONDUCTOR_COMPOSER__TEST_MODE must be 'false' for live E2E"
 fi
 
 BASE="${CONDUCTOR_BASE_URL}"
@@ -111,9 +115,32 @@ check_contains() {
     fi
 }
 
+_CANONICAL_PRINTED=false
+
+_fail() {
+    echo ""
+    echo "COMPOSER LIVE E2E FAILED: ${STAGE:-unknown stage} — $1"
+    _CANONICAL_PRINTED=true
+    exit 1
+}
+
+_block() {
+    echo ""
+    echo "COMPOSER LIVE E2E BLOCKED: ${STAGE:-unknown stage} — $1"
+    _CANONICAL_PRINTED=true
+    exit 2
+}
+
 cleanup() {
     if [[ -n "${VERIFY_DIR}" && -d "${VERIFY_DIR}" ]]; then
         rm -rf "${VERIFY_DIR}"
+    fi
+    if [[ -n "${BASELINE_SETUP_DIR}" && -d "${BASELINE_SETUP_DIR}" ]]; then
+        rm -rf "${BASELINE_SETUP_DIR}"
+    fi
+    # Remove the disposable baseline branch if it was created
+    if [[ -n "${BASELINE_BRANCH:-}" && "${REPO_URL}" != file://* && "${REPO_URL}" != "" ]]; then
+        git push origin --delete "${BASELINE_BRANCH}" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -136,8 +163,7 @@ poll_until() {
     echo "  TIMEOUT: ${desc} after ${waited}s"
     echo "  Last response excerpt: $(echo "$R" | python3 -c "import sys; print(sys.stdin.read()[:300])" 2>/dev/null || echo 'parse error')"
     echo ""
-    echo "COMPOSER LIVE E2E TIMED OUT: ${STAGE}"
-    exit 1
+    _fail "timeout — ${STAGE}"
 }
 
 echo "=== Composer Live E2E ==="
@@ -247,22 +273,106 @@ if [[ "${REPO_URL}" == file://* && -d "${REPO_DIR}/.git" ]]; then
 fi
 
 # ── Disposable starting state proof ───────────────────────────────────────
-# Record the starting commit SHA so we can prove the pipeline actually
-# changed the code.  For HTTP repos, clone into a temp dir to capture
-# the exact baseline commit before the pipeline runs.
+# Build a unique orphan baseline branch on the remote repo so Composer
+# starts from exactly add-only (multiply/divide are guaranteed absent).
+# Do NOT mutate the repo's default branch.
 BASELINE_SHA=""
+BASELINE_BRANCH=""
+BASELINE_SETUP_DIR=""
 if [[ "${REPO_URL}" == file://* && -d "${REPO_DIR}/.git" ]]; then
     BASELINE_SHA=$(cd "${REPO_DIR}" && git rev-parse HEAD)
 else
-    # Clone to capture the baseline from the remote, then discard
-    BASELINE_CLONE_DIR="/tmp/composer-baseline-$(date +%s)"
-    git clone --bare "${REPO_URL}" "${BASELINE_CLONE_DIR}" 2>/dev/null || true
-    if [[ -d "${BASELINE_CLONE_DIR}/HEAD" || -d "${BASELINE_CLONE_DIR}/objects" ]]; then
-        BASELINE_SHA=$(git -C "${BASELINE_CLONE_DIR}" rev-parse HEAD 2>/dev/null || echo "")
+    BASELINE_BRANCH="composer-live-baseline-$(date +%s)"
+    BASELINE_SETUP_DIR="/tmp/composer-baseline-setup-$(date +%s)"
+    STAGE="baseline setup"
+    echo "--- Establish Disposable Baseline (orphan branch) ---"
+
+    # 1. Clone into a throwaway setup directory
+    if git clone "${REPO_URL}" "${BASELINE_SETUP_DIR}" 2>/dev/null; then true; else
+        _fail "baseline clone failed"
     fi
-    rm -rf "${BASELINE_CLONE_DIR}" 2>/dev/null || true
+
+    cd "${BASELINE_SETUP_DIR}"
+
+    # 2. Create orphan branch
+    git checkout --orphan "${BASELINE_BRANCH}" 2>/dev/null
+    # 3. Remove all tracked content from staging (orphan starts empty)
+    git rm -rf --quiet . 2>/dev/null || true
+
+    # 4. Populate with exactly the add-only files
+    mkdir -p calculator
+    cat > calculator/__init__.py <<'EOF'
+"""Simple calculator package for E2E testing."""
+
+def add(a: int, b: int) -> int:
+    return a + b
+EOF
+    cat > calculator/test_calculator.py <<'EOF'
+from calculator import add
+
+def test_add():
+    assert add(2, 3) == 5
+    assert add(0, 0) == 0
+EOF
+    cat > pyproject.toml <<'EOF'
+[project]
+name = "calculator"
+version = "0.1.0"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["calculator"]
+EOF
+
+    # 5. Assert locally: add works
+    INITIAL_ADD=$(python3 -c "from calculator import add; print(add(1,2))" 2>/dev/null || echo "err")
+    if [[ "${INITIAL_ADD}" != "3" ]]; then
+        _fail "baseline add(1,2) != 3 (got ${INITIAL_ADD})"
+    fi
+    echo "  PASS: baseline add works"
+
+    # 6. Assert: multiply is absent
+    if python3 -c "from calculator import multiply" 2>/dev/null; then
+        _fail "baseline has multiply"
+    fi
+    echo "  PASS: baseline has no multiply"
+
+    # 7. Assert: divide is absent
+    if python3 -c "from calculator import divide" 2>/dev/null; then
+        _fail "baseline has divide"
+    fi
+    echo "  PASS: baseline has no divide"
+
+    # 8. Assert: baseline tests pass
+    if ! uv run pytest -q 2>/dev/null; then
+        _fail "baseline pytest failed"
+    fi
+    echo "  PASS: baseline pytest passes"
+
+    # 9. Commit baseline
+    git add calculator/__init__.py calculator/test_calculator.py pyproject.toml
+    git commit --quiet -m "baseline: add-only calculator" 2>/dev/null
+    BASELINE_SHA=$(git rev-parse HEAD)
+    echo "  baseline_sha=${BASELINE_SHA}"
+
+    # 10. Push baseline branch
+    if ! git push origin "${BASELINE_BRANCH}" 2>/dev/null; then
+        _fail "baseline push failed"
+    fi
+    echo "  PASS: baseline branch pushed"
+
+    cd - >/dev/null
+    rm -rf "${BASELINE_SETUP_DIR}" 2>/dev/null || true
+    BASELINE_SETUP_DIR=""
+
+    # Use the baseline branch as the Composer target
+    BRANCH_NAME="${BASELINE_BRANCH}"
 fi
-echo "  baseline_sha=${BASELINE_SHA}"
+echo "  baseline_sha=${BASELINE_SHA}  target_branch=${BRANCH_NAME}"
 
 R=$(curl -sf -X POST "${BASE}/composer/objectives" \
     -H "Content-Type: application/json" \
@@ -441,6 +551,8 @@ else:
 check "integration verification passed (real GW)" "passed" "${INTEG_VERIF}"
 
 # ── 11b. Integration branch was pushed to remote (auto_push proof) ──────────
+# Correct contract: list artifacts, find result.json by name, get its
+# artifact ID, download that artifact (not the GW task ID).
 STAGE="check integration pushed"
 echo "--- Integration Push Proof ---"
 INTEG_PUSHED=$(echo "$R" | python3 -c "
@@ -452,20 +564,58 @@ headers = {}
 if gw_token:
     headers['X-Auth-Internal-Token'] = gw_token
 it = [t for t in tasks if t.get('node_key')=='integration']
-pushed = 'false'
-if it and it[0].get('agents_gateway_task_id'):
-    gw_id = it[0]['agents_gateway_task_id']
-    try:
-        req = urllib.request.Request(f'{gw_base}/artifacts/{gw_id}?view=true', headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = resp.read()
-            result = json.loads(data) if isinstance(data, bytes) else json.loads(str(data))
-            git_info = result.get('git', {}) if isinstance(result, dict) else {}
-            pushed = str(git_info.get('pushed', False)).lower()
-    except Exception:
-        pass
-print(pushed)
-" 2>/dev/null || echo "false")
+if not it or not it[0].get('agents_gateway_task_id'):
+    print('error:no_integration_task')
+    sys.exit(0)
+gw_task_id = it[0]['agents_gateway_task_id']
+
+try:
+    # 1. Get artifact list
+    req = urllib.request.Request(f'{gw_base}/tasks/{gw_task_id}/artifacts', headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        arts = json.loads(resp.read()).get('artifacts', [])
+except Exception:
+    print('error:artifact_list_failed')
+    sys.exit(0)
+
+# 2. Find result.json
+result_art = None
+for a in arts:
+    if a.get('name') == 'result.json':
+        result_art = a
+        break
+if not result_art:
+    print('error:result_json_missing')
+    sys.exit(0)
+art_id = result_art.get('id', '')
+if not art_id:
+    print('error:artifact_id_missing')
+    sys.exit(0)
+
+# 3. Download result.json
+try:
+    req = urllib.request.Request(f'{gw_base}/artifacts/{art_id}?view=true', headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = resp.read()
+        result = json.loads(data) if isinstance(data, bytes) else json.loads(str(data))
+except Exception:
+    print('error:artifact_download_failed')
+    sys.exit(0)
+
+# 4. Parse git.pushed
+try:
+    git_info = result.get('git', {}) if isinstance(result, dict) else {}
+    pushed = str(git_info.get('pushed', False)).lower()
+except Exception:
+    pushed = 'error:parse_failed'
+    print('error:json_parse_failed')
+    sys.exit(0)
+
+if pushed != 'true':
+    print(f'error:git_pushed_is_{pushed}')
+else:
+    print(pushed)
+" 2>/dev/null || echo "error")
 check "integration branch pushed to remote (auto_push required)" "true" "${INTEG_PUSHED}"
 
 # ── 12. Final branch and commit SHA recovered from real evidence ───────────
@@ -591,9 +741,13 @@ echo "Passed: ${PASS}"
 echo "Failed: ${FAIL}"
 
 if [ "$FAIL" -eq 0 ]; then
+    echo ""
     echo "COMPOSER LIVE E2E PASSED"
+    _CANONICAL_PRINTED=true
     exit 0
 else
+    echo ""
     echo "COMPOSER LIVE E2E FAILED: ${STAGE}"
+    _CANONICAL_PRINTED=true
     exit 1
 fi

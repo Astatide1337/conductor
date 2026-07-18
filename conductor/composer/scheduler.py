@@ -201,7 +201,32 @@ class Scheduler:
                     status="dispatching",
                 )
 
-            self.agents_gateway.run_task(gw_task.id)
+            try:
+                self.agents_gateway.run_task(gw_task.id)
+            except Exception as run_exc:
+                # create_harness_task succeeded, run_task failed —
+                # attempt to cancel the phantom task, persist both
+                # old and new GW IDs in evidence, emit restart_failed.
+                logger.error("run_task failed for new GW task %s (node %s): %s",
+                             gw_task.id, node.node_id, run_exc)
+                try:
+                    self.agents_gateway.cancel_task(gw_task.id)
+                except Exception:
+                    pass
+                composer_emit(self.conductor_storage or self.storage,
+                              "composer.task_restart_failed",
+                              f"run_task_failed: {run_exc}",
+                              objective_id=objective_id,
+                              payload={"node_id": node.node_id,
+                                       "attempt": attempt,
+                                       "new_gw_task_id": gw_task.id,
+                                       "partial_creation": True})
+                return {
+                    "node_id": node.node_id,
+                    "gw_task_id": None,
+                    "partial_gw_task_id": gw_task.id,
+                    "run_failed": True,
+                }
 
             if pt:
                 self.storage.update_plan_task(pt["id"], status="running")
@@ -209,6 +234,15 @@ class Scheduler:
             composer_emit(self.conductor_storage or self.storage, "composer.task_dispatched", "",
                           objective_id=objective_id,
                           payload={"node_id": node.node_id, "gw_task_id": gw_task.id})
+
+            # Emit task_restarted only for non-attempt-1 dispatches that
+            # successfully started (the first dispatch already emitted
+            # composer.task_dispatching → composer.task_dispatched).
+            if attempt > 1:
+                composer_emit(self.conductor_storage or self.storage, "composer.task_restarted", "",
+                              objective_id=objective_id,
+                              payload={"node_id": node.node_id, "attempt": attempt,
+                                       "gw_task_id": gw_task.id})
 
             if self.metrics:
                 self.metrics.inc("conductor_composer_tasks_dispatched_total")
@@ -268,22 +302,17 @@ class Scheduler:
         The original ``node.goal`` is never mutated — failure context is
         injected into a per-dispatch copy so that the durable SQLite
         ``goal`` column stays the exact planned text.
+
+        ``composer.task_restarted`` is emitted by the dispatch layer
+        only after ``run_task`` succeeds — never before the agent starts.
         """
         from copy import deepcopy
         dispatched_node = deepcopy(node)
         if failure_context:
-            # Preserve original goal separately (unchanged below).
-            # The metadata_pass into update_plan_task keeps node.goal
-            # so callers can persist attempt history without ever
-            # mutating the source of truth.
             dispatched_node.goal = (
                 f"{node.goal}\n\nPrevious attempt failed with: "
                 f"{failure_context}\nPlease diagnose and continue working."
             )
-
-        composer_emit(self.conductor_storage or self.storage, "composer.task_restarted", "",
-                      objective_id=objective_id,
-                      payload={"node_id": node.node_id, "attempt": attempt})
 
         if self.metrics:
             self.metrics.inc("conductor_composer_task_restarts_total")
