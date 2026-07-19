@@ -38,30 +38,57 @@ class TestAuthHandler:
 
     def test_cloudflare_no_cf_denied(self):
         handler = AuthHandler(
-            AuthConfig(mode="cloudflare-access", cloudflare_team_domain="test.cloudflareaccess.com")
+            AuthConfig(
+                mode="cloudflare-access",
+                cloudflare_team_domain="test.cloudflareaccess.com",
+                cloudflare_aud="test-aud",
+            )
         )
         result = handler.check("127.0.0.1")
         assert not result.allowed
+        assert "Cf-Access-Jwt-Assertion" in (result.error or "")
 
-    def test_cloudflare_with_jwt_allowed(self):
+    def test_cloudflare_garbage_jwt_denied(self):
+        """Unsigned / malformed payloads must NOT be accepted. The previous
+        implementation accepted any non-empty string here — that was an auth
+        bypass and is now closed by real PyJWT signature verification."""
         handler = AuthHandler(
-            AuthConfig(mode="cloudflare-access", cloudflare_team_domain="test.cloudflareaccess.com")
+            AuthConfig(
+                mode="cloudflare-access",
+                cloudflare_team_domain="test.cloudflareaccess.com",
+                cloudflare_aud="test-aud",
+            )
         )
         result = handler.check("127.0.0.1", cf_jwt="fake-jwt")
-        assert result.allowed
-        assert result.user == "cf"
+        assert not result.allowed
+        # No network/JWKS in tests => _verify_cf_jwt returns None =>
+        # "invalid or expired Cloudflare Access JWT".
+        assert "invalid" in (result.error or "").lower() or "expired" in (result.error or "").lower()
 
     def test_cloudflare_internal_bypass(self):
         handler = AuthHandler(
             AuthConfig(
                 mode="cloudflare-access",
                 cloudflare_team_domain="test.cloudflareaccess.com",
+                cloudflare_aud="test-aud",
                 internal_secret="s3cret",
             )
         )
         result = handler.check("127.0.0.1", internal_token="s3cret")
         assert result.allowed
         assert result.user == "internal"
+
+    def test_cloudflare_missing_aud_raises(self):
+        """Constructing a cloudflare-access handler without cloudflare_aud is
+        a configuration error and must fail loudly at boot, not silently at
+        request time."""
+        with pytest.raises(Exception):
+            AuthHandler(
+                AuthConfig(
+                    mode="cloudflare-access",
+                    cloudflare_team_domain="test.cloudflareaccess.com",
+                )
+            )
 
     def test_production_safety_internal_ok(self):
         handler = AuthHandler(
