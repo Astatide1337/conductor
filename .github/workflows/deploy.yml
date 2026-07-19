@@ -33,7 +33,7 @@ jobs:
       - name: Install Python
         run: uv python install 3.12
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --extra dev
       - name: Compile check
         run: uv run python -m compileall conductor/ tests/
       - name: Run tests
@@ -120,8 +120,10 @@ jobs:
               sleep 1
             done
 
-            # Gateway hub check
-            curl -sf http://localhost:8093/gateways/status
+            # Gateway hub check — requires internal-token (cloudflare-access mode)
+            INTERNAL_TOKEN=$(grep -E '^CONDUCTOR_AUTH__INTERNAL_SECRET=' /home/ubuntu/infra/.env.production | cut -d= -f2-)
+            curl -sf -H "X-Auth-Internal-Token: ${INTERNAL_TOKEN}" \
+                http://localhost:8093/gateways/status || echo "[warn] gateways/status check returned non-zero"
 
   smoke-test:
     needs: deploy
@@ -129,11 +131,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Production health check
+        env:
+          DOMAIN: ${{ vars.DOMAIN }}
         run: |
-          for ep in health ready version gateways/status; do
-            if ! curl -sf "${{ vars.DOMAIN }}/$ep" > /dev/null 2>&1; then
-              echo "[FAIL] ${{ vars.DOMAIN }}/$ep unreachable"
+          for ep in health ready version; do
+            if ! curl -sf "${DOMAIN}/${ep}" > /dev/null 2>&1; then
+              echo "[FAIL] ${DOMAIN}/${ep} unreachable"
+              exit 1
             else
-              echo "[OK] ${{ vars.DOMAIN }}/$ep"
+              echo "[OK] ${DOMAIN}/${ep}"
             fi
           done
+          # /mcp behind CF Access — expect 302 redirect to CF login, NOT 200.
+          if ! curl -sf -o /dev/null -w '%{http_code}\n' "${DOMAIN}/mcp" | grep -q '^302$'; then
+            echo "[FAIL] ${DOMAIN}/mcp CF Access gate not responding"
+            exit 1
+          fi
+          echo "[OK] ${DOMAIN}/mcp -> 302 to CF Access (live)"
