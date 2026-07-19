@@ -39,12 +39,40 @@ jobs:
       - name: Run tests
         id: test
         run: uv run pytest tests/ -v
+      - name: Start Conductor (dev-none, background)
+        run: |
+          # Boot a Conductor on localhost:8093 in dev-none auth mode for
+          # the local E2E scripts. CI env defaults to dev mode (no
+          # CONDUCTOR_ENVIRONMENT=production set), so dev-none is allowed.
+          CONDUCTOR_AUTH__MODE=dev-none \
+          CONDUCTOR_COMPOSER__TEST_MODE=true \
+          nohup uv run conductor run --host 127.0.0.1 --port 8093 \
+              > /tmp/conductor-ci.log 2>&1 &
+          echo $! > /tmp/conductor-ci.pid
+          # Wait for health (max 30s)
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8093/health > /dev/null 2>&1; then
+              echo "[OK] Conductor CI boot took ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "[FAIL] Conductor did not become healthy in 30s. Logs:"
+          cat /tmp/conductor-ci.log
+          exit 1
       - name: Local E2E
         run: bash scripts/e2e-local.sh
       - name: Gateway hub E2E
         run: bash scripts/e2e-local-gateway-hub.sh
       - name: Composer local E2E
         run: bash scripts/e2e-composer-local.sh
+      - name: Stop Conductor (CI)
+        if: always()
+        run: |
+          if [ -f /tmp/conductor-ci.pid ]; then
+            kill "$(cat /tmp/conductor-ci.pid)" 2>/dev/null || true
+            rm -f /tmp/conductor-ci.pid
+          fi
       - name: Shell prerequisite tests
         run: bash tests/test_e2e_prerequisite_blocks.sh
 
