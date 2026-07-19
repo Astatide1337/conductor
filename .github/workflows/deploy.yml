@@ -1,0 +1,139 @@
+name: Deploy Production
+
+on:
+  push:
+    branches: [master, main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+env:
+  IMAGE_NAME: astatide-conductor
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      test_passed: ${{ steps.test.outcome == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: Install Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync
+      - name: Compile check
+        run: uv run python -m compileall conductor/ tests/
+      - name: Run tests
+        id: test
+        run: uv run pytest tests/ -v
+      - name: Local E2E
+        run: bash scripts/e2e-local.sh
+      - name: Gateway hub E2E
+        run: bash scripts/e2e-local-gateway-hub.sh
+      - name: Composer local E2E
+        run: bash scripts/e2e-composer-local.sh
+      - name: Shell prerequisite tests
+        run: bash tests/test_e2e_prerequisite_blocks.sh
+
+  build-and-push:
+    needs: test
+    if: needs.test.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=composer-v1
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment || 'production' }}
+      url: ${{ vars.DOMAIN }}
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/infra
+
+            # Pull new image
+            docker compose \
+              --env-file .env.production \
+              -f docker-compose.production.yml \
+              pull conductor
+
+            # Rolling restart
+            docker compose \
+              --env-file .env.production \
+              -f docker-compose.production.yml \
+              up -d --no-deps conductor
+
+            # Health probe
+            for i in $(seq 1 30); do
+              if curl -sf http://localhost:8093/health > /dev/null 2>&1; then
+                echo "[OK] Conductor healthy after restart"
+                break
+              fi
+              sleep 1
+            done
+
+            # Gateway hub check
+            curl -sf http://localhost:8093/gateways/status
+
+  smoke-test:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Production health check
+        run: |
+          for ep in health ready version gateways/status; do
+            if ! curl -sf "${{ vars.DOMAIN }}/$ep" > /dev/null 2>&1; then
+              echo "[FAIL] ${{ vars.DOMAIN }}/$ep unreachable"
+            else
+              echo "[OK] ${{ vars.DOMAIN }}/$ep"
+            fi
+          done
