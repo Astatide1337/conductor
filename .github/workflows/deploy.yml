@@ -44,8 +44,13 @@ jobs:
           # Boot a Conductor on localhost:8093 in dev-none auth mode for
           # the local E2E scripts. CI env defaults to dev mode (no
           # CONDUCTOR_ENVIRONMENT=production set), so dev-none is allowed.
+          # composer.report_dir defaults to /var/lib/conductor which doesn't
+          # exist in CI runners — override to a writable temp dir.
+          mkdir -p /tmp/composer-reports /tmp/conductor-data
           CONDUCTOR_AUTH__MODE=dev-none \
           CONDUCTOR_COMPOSER__TEST_MODE=true \
+          CONDUCTOR_COMPOSER_REPORT_DIR=/tmp/composer-reports \
+          CONDUCTOR_STORAGE__SQLITE_PATH=/tmp/conductor-data/conductor.db \
           nohup uv run conductor run --host 127.0.0.1 --port 8093 \
               > /tmp/conductor-ci.log 2>&1 &
           echo $! > /tmp/conductor-ci.pid
