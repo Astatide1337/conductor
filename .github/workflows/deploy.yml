@@ -90,6 +90,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Buildx (docker-container driver for GHA cache)
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
