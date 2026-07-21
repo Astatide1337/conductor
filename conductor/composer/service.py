@@ -374,6 +374,7 @@ class ComposerService:
             goal="Integration: combine task branches and run full verification",
             dependencies=plan_result.integration.dependencies,
             verification=plan_result.integration.verification,
+            harness_profile=self.config.integration_harness_profile,
         )
 
         plan = ComposerPlan(
