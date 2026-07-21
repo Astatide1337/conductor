@@ -101,8 +101,8 @@ class ComposerConfig(BaseModel):
     max_parallel_tasks: int = 3
     max_repair_retries: int = 3
     poll_interval_seconds: float = 10.0
-    default_harness_profile: str = "opencode-deepseek"
-    integration_harness_profile: str = "opencode-deepseek"
+    default_harness_profile: str = "pi-coding-agent"
+    integration_harness_profile: str = "pi-coding-agent"
     auto_start: bool = True
     auto_commit: bool = True
     auto_push: bool = False

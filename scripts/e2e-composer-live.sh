@@ -203,10 +203,11 @@ def test_add():
     assert add(2, 3) == 5
     assert add(0, 0) == 0
 EOF
-        cat > pyproject.toml <<'EOF'
+    cat > pyproject.toml <<'EOF'
 [project]
 name = "calculator"
 version = "0.1.0"
+dependencies = ["pytest>=7"]
 
 [build-system]
 requires = ["setuptools"]
@@ -267,7 +268,8 @@ Requirements:
 - Add divide(a,b) returning a/b; raise ValueError for b=0.
 - Use the repository and base branch provided.
 - Include pytest tests in calculator/test_calculator.py.
-- Run uv run pytest -q in the project root.
+- Run uvx pytest -q in the project root to verify.
+- IMPORTANT: Use `uvx pytest` (NOT `uv run pytest`) for ALL verification commands. The `uv run` command fails when the project path contains a colon (`:`) — which the worktree directory always does (because of the `git@github.com:owner/repo` URL layout). `uvx pytest` is equivalent and works correctly. Use `-k <pattern>` to select tests (e.g. `uvx pytest -q -k multiply`). NEVER use the pytest `::test_name` node-id syntax with `uvx` (e.g. `uvx pytest file.py::test_foo`) — use `-k` instead.
 - Produce an integration branch with all changes.'
 
 BRANCH_NAME="${COMPOSER_LIVE_REPO_BRANCH:-main}"
@@ -328,6 +330,7 @@ EOF
 [project]
 name = "calculator"
 version = "0.1.0"
+dependencies = ["pytest>=7"]
 
 [build-system]
 requires = ["setuptools"]

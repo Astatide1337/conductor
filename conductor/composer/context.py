@@ -99,10 +99,10 @@ def build_composer_context(
                         name=p_name,
                         harness=_get(p, "harness", ""),
                         display_name=_get(p, "display_name", p_name),
-                        configured=_get(availability, "configured", False) if availability else False,
-                        runnable=_get(availability, "runnable", False) if availability else False,
-                        binary_present=_get(availability, "binary_present", False) if availability else False,
-                        credentials_present=_get(availability, "credentials_present", False) if availability else False,
+                        configured=bool(_get(availability, "configured", False)) if availability else False,
+                        runnable=bool(_get(availability, "runnable", False)) if availability else False,
+                        binary_present=bool(_get(availability, "binary_present", False)) if availability else False,
+                        credentials_present=bool(_get(availability, "credentials_present", False)) if availability else False,
                         command=_get(availability, "command", "") if availability else _get(p, "command", ""),
                     )
                 )
@@ -591,9 +591,13 @@ def context_to_prompt(ctx: ComposerContext) -> str:
     if pc.get("tree_summary"):
         lines.append(f"Repo files: {', '.join(pc['tree_summary'][:30])}")
     if ctx.harness_profiles:
-        names = [p.name for p in ctx.harness_profiles if p.runnable]
-        if names:
-            lines.append(f"Runnable harness profiles: {', '.join(names)}")
+        runnable = [p.name for p in ctx.harness_profiles if p.runnable]
+        all_names = [p.name for p in ctx.harness_profiles]
+        if runnable:
+            lines.append(f"Runnable harness profiles: {', '.join(runnable)}")
+            lines.append("You MUST use ONLY runnable profiles listed above for harness_profile.")
+        if all_names:
+            lines.append(f"All registered harness profiles: {', '.join(all_names)}")
     if ctx.skills:
         lines.append(f"Skills available: {', '.join(s.id or s.name for s in ctx.skills[:10])}")
     if ctx.capabilities:
