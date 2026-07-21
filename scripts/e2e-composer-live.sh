@@ -60,11 +60,21 @@ cleanup() {
     if [[ -n "${VERIFY_DIR}" && -d "${VERIFY_DIR}" ]]; then
         rm -rf "${VERIFY_DIR}"
     fi
-    if [[ -n "${BASELINE_SETUP_DIR}" && -d "${BASELINE_SETUP_DIR}" ]]; then
+    # Keep BASELINE_SETUP_DIR on failure for diagnosis; only remove on
+    # script-completed-clean. We test the captured exit-status via
+    # the E2E_CLEAN_OK flag set at the end of the script.
+    if [[ -n "${BASELINE_SETUP_DIR}" && -d "${BASELINE_SETUP_DIR}" && "${E2E_CLEAN_OK:-0}" == "1" ]]; then
         rm -rf "${BASELINE_SETUP_DIR}"
     fi
-    # Remove the disposable baseline branch if it was created
-    if [[ -n "${BASELINE_BRANCH:-}" && "${REPO_URL:-}" != file://* && "${REPO_URL:-}" != "" ]]; then
+    # Only delete the disposable baseline branch if the script
+    # completed cleanly. Otherwise the integration branch still in
+    # flight depends on this baseline and `git fetch composer-...-baseline-N`
+    # in AGW workspace.fetch() will fail with
+    # "couldn't find remote ref composer-live-baseline-...".
+    if [[ "${E2E_CLEAN_OK:-0}" == "1" \
+            && -n "${BASELINE_BRANCH:-}" \
+            && "${REPO_URL:-}" != file://* \
+            && -n "${REPO_URL:-}" ]]; then
         git push "${REPO_URL}" --delete "${BASELINE_BRANCH}" 2>/dev/null || true
     fi
 }
@@ -361,7 +371,7 @@ EOF
     echo "  PASS: baseline has no divide"
 
     # 8. Assert: baseline tests pass
-    if ! uv run pytest -q 2>/dev/null; then
+    if ! uv sync --quiet 2>&1 || ! uv run --quiet pytest -q 2>&1; then
         _fail "baseline pytest failed"
     fi
     echo "  PASS: baseline pytest passes"
@@ -430,7 +440,7 @@ poll_until "plan generated" 120 "${BASE}/composer/objectives/${OBJ_ID}/plan" \
     "2\|3\|4\|5\|6"
 
 # ── 6. At least 2 real harness tasks dispatched ────────────────────────────
-poll_until "tasks dispatched" 180 "${BASE}/composer/objectives/${OBJ_ID}/tasks" \
+poll_until "tasks dispatched" $((TIMEOUT_SEC / 3)) "${BASE}/composer/objectives/${OBJ_ID}/tasks" \
     "import sys,json; d=json.load(sys.stdin); dispatched=[t for t in d.get('tasks',[]) if t.get('status') in ('dispatching','running','completed','verifying')]; print(len(dispatched))" \
     "2\|3\|4\|5"
 
@@ -714,7 +724,7 @@ fi
 # ── 15. Run pytest against the FINAL checkout (not the base checkout) ─────
 STAGE="run pytest on final checkout"
 echo "--- Run pytest in final checkout ---"
-if [[ -d "${VERIFY_DIR}" ]] && cd "${VERIFY_DIR}" && uv run pytest -q 2>/dev/null; then
+if [[ -d "${VERIFY_DIR}" ]] && cd "${VERIFY_DIR}" && uv sync --quiet 2>/dev/null && uv run --quiet pytest -q 2>/dev/null; then
     echo "  PASS: pytest passed against final checkout"
     PASS=$((PASS + 1))
 else
@@ -763,6 +773,7 @@ if [ "$FAIL" -eq 0 ]; then
     echo ""
     echo "COMPOSER LIVE E2E PASSED"
     _CANONICAL_PRINTED=true
+    E2E_CLEAN_OK=1
     exit 0
 else
     echo ""
