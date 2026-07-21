@@ -47,6 +47,12 @@ class LLMError(Exception):
     """Raised when the Composer LLM provider fails after all retries."""
 
 
+class LLMBillingError(LLMError):
+    """LLM provider returned a payment-required (402) or rate-limited (429)
+    response. Distinct from generic LLMError so upper layers can apply a
+    graceful fallback (e.g. drop to a free-tier model)."""
+
+
 @dataclass
 class LLMRepairRequest:
     """Return value when JSON validation fails and a repair is attempted."""
@@ -233,9 +239,17 @@ class HttpComposerLLMClient(ComposerLLMClient):
 
     Supports OpenRouter or any OpenAI-compatible endpoint.  Never logs
     API keys, prompts, or raw responses at INFO level.
+
+    Falls back from a configured paid model (``primary_model``) to a
+    configured free-tier model (``fallback_model``) on payment-required
+    (402) or rate-limited (429) responses from the upstream provider.
+    This is the primary defense against running out of mid-run credit
+    — the planner can degrade to a free model without operator input.
     """
 
     MAX_REPAIR_RETRIES = 2
+
+    BILLING_STATUSES = (402, 429)
 
     def __init__(
         self,
@@ -244,13 +258,27 @@ class HttpComposerLLMClient(ComposerLLMClient):
         model: str,
         timeout: float = 180.0,
         max_tokens: int = 8192,
+        fallback_model: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
-        self._model = model
+        self._primary_model = model
+        self._fallback_model = fallback_model
+        self._current_model = model
+        self._fell_back = False
         self._timeout = timeout
         self._max_tokens = max_tokens
         self._client: httpx.AsyncClient | None = None
+
+    @property
+    def active_model(self) -> str:
+        """The model the next request will use. Useful for logs / API."""
+        return self._current_model
+
+    @property
+    def did_fall_back(self) -> bool:
+        """True iff a 402/429 already forced us to the fallback model."""
+        return self._fell_back
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -258,34 +286,63 @@ class HttpComposerLLMClient(ComposerLLMClient):
         return self._client
 
     async def _chat(self, user_msg: str) -> str:
-        """Send a chat/completions request. Returns the assistant message text."""
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
+        """Send a chat/completions request. Returns the assistant message text.
+
+        On a billing-style status (402 payment-required, 429 rate-limited)
+        and a configured ``fallback_model``, the client retries once with
+        the fallback model and flips its ``active_model`` so later calls
+        also avoid the paid endpoint. Other HTTP errors propagate as
+        LLMError as before.
+        """
         body = {
-            "model": self._model,
+            "model": self._current_model,
             "messages": [{"role": "user", "content": user_msg}],
             "max_tokens": self._max_tokens,
             "temperature": 0.3,
         }
         url = f"{self._base_url}/chat/completions"
         client = await self._ensure_client()
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
         try:
             resp = await client.post(url, headers=headers, json=body)
-            resp.raise_for_status()
         except httpx.TimeoutException as exc:
             raise LLMError(f"LLM provider timed out: {exc}") from exc
-        except httpx.HTTPStatusError as exc:
-            raise LLMError(f"LLM provider returned {exc.response.status_code}") from exc
         except httpx.HTTPError as exc:
             raise LLMError(f"LLM provider error: {exc}") from exc
+
+        if resp.status_code in self.BILLING_STATUSES:
+            if not self._fell_back and self._fallback_model \
+                    and self._fallback_model != self._primary_model:
+                # Switch to the fallback model and retry exactly once.
+                self._current_model = self._fallback_model
+                self._fell_back = True
+                body["model"] = self._current_model
+                resp = await client.post(url, headers=headers, json=body)
+                if resp.status_code >= 400:
+                    raise LLMBillingError(
+                        f"LLM provider {resp.status_code} on fallback "
+                        f"model {self._fallback_model}: "
+                        f"{resp.text[:300]}"
+                    )
+            else:
+                raise LLMBillingError(
+                    f"LLM provider {resp.status_code} "
+                    f"(model={self._current_model}): {resp.text[:300]}"
+                )
+        if resp.status_code >= 400:
+            raise LLMError(
+                f"LLM provider returned {resp.status_code}: {resp.text[:300]}"
+            )
 
         data = resp.json()
         choices = data.get("choices", [])
         if not choices:
             raise LLMError("LLM provider returned no choices")
-        return choices[0].get("message", {}).get("content", "")
+        return choices[0].get("message", {}).get("content", "") or ""
+
 
     async def _chat_with_repair(self, user_msg: str, model_cls):
         """Call _chat, validate, optionally repair, retry."""

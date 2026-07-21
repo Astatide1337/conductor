@@ -97,7 +97,13 @@ class ComposerConfig(BaseModel):
     llm_base_url: str = "https://openrouter.ai/api/v1"
     llm_api_key: str = ""
     llm_model: str = ""
+    # Free-tier fallback model id used when the primary model returns a
+    # billing-style status (402 payment-required or 429 rate-limited).
+    # Defaults to ``openai/gpt-oss-20b:free`` which is reliably served
+    # on OpenRouter's free tier as of this writing.
+    llm_fallback_model: str = "openai/gpt-oss-20b:free"
     llm_timeout_seconds: float = 180.0
+    llm_max_tokens: int = 2048
     max_parallel_tasks: int = 3
     max_repair_retries: int = 3
     poll_interval_seconds: float = 10.0
@@ -166,7 +172,9 @@ def _env_overrides() -> dict:
         "composer_llm_base_url": ("composer", "llm_base_url"),
         "composer_llm_api_key": ("composer", "llm_api_key"),
         "composer_llm_model": ("composer", "llm_model"),
+        "composer_llm_fallback_model": ("composer", "llm_fallback_model"),
         "composer_llm_timeout_seconds": ("composer", "llm_timeout_seconds"),
+        "composer_llm_max_tokens": ("composer", "llm_max_tokens"),
         "composer_enabled": ("composer", "enabled"),
         "composer_test_mode": ("composer", "test_mode"),
         "composer_max_parallel_tasks": ("composer", "max_parallel_tasks"),

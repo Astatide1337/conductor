@@ -221,6 +221,8 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
                 base_url=cfg.composer.llm_base_url,
                 api_key=cfg.composer.llm_api_key,
                 model=cfg.composer.llm_model,
+                fallback_model=cfg.composer.llm_fallback_model or None,
+                max_tokens=cfg.composer.llm_max_tokens,
                 timeout=cfg.composer.llm_timeout_seconds,
             )
         else:
@@ -322,9 +324,20 @@ def create_app(cfg: ConductorConfig, metrics_reg: MetricsRegistry | None = None)
         result: dict = {"status": "ok", "service": "astatide-conductor"}
         composer = getattr(app.state, "composer", None)
         if composer is not None:
-            from conductor.composer.llm import FakeComposerLLMClient
-            result["composer_llm_provider"] = "fake" if isinstance(composer.llm, FakeComposerLLMClient) else "http"
-            result["composer_llm_model"] = getattr(composer.llm, "model", "") or getattr(composer.config, "llm_model", "")
+            from conductor.composer.llm import FakeComposerLLMClient, HttpComposerLLMClient
+            llm = composer.llm
+            if isinstance(llm, FakeComposerLLMClient):
+                result["composer_llm_provider"] = "fake"
+                result["composer_llm_model"] = "fake"
+            elif isinstance(llm, HttpComposerLLMClient):
+                result["composer_llm_provider"] = "http"
+                result["composer_llm_model"] = getattr(llm, "active_model", "")
+                result["composer_llm_fell_back"] = llm.did_fall_back
+                result["composer_llm_primary"] = getattr(llm, "_primary_model", "")
+                result["composer_llm_fallback"] = getattr(llm, "_fallback_model", "")
+            else:
+                result["composer_llm_provider"] = "http"
+                result["composer_llm_model"] = getattr(composer.config, "llm_model", "")
         return result
 
     @app.get("/ready")
