@@ -158,6 +158,7 @@ class IntegrationNode(BaseModel):
     agents_gateway_task_id: str | None = None
     branch: str | None = None
     commit_sha: str | None = None
+    harness_profile: str = "pi-coding-agent"
 
 
 class ComposerPlan(BaseModel):

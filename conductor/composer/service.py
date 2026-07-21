@@ -1048,6 +1048,8 @@ class ComposerService:
                     agents_gateway_task_id=pt.get("agents_gateway_task_id"),
                     branch=pt.get("branch"),
                     commit_sha=pt.get("commit_sha"),
+                    harness_profile=pt.get("harness_profile")
+                        or self.config.integration_harness_profile,
                 )
             else:
                 tasks.append(TaskNode(
