@@ -592,12 +592,10 @@ def context_to_prompt(ctx: ComposerContext) -> str:
         lines.append(f"Repo files: {', '.join(pc['tree_summary'][:30])}")
     if ctx.harness_profiles:
         runnable = [p.name for p in ctx.harness_profiles if p.runnable]
-        all_names = [p.name for p in ctx.harness_profiles]
         if runnable:
             lines.append(f"Runnable harness profiles: {', '.join(runnable)}")
             lines.append("You MUST use ONLY runnable profiles listed above for harness_profile.")
-        if all_names:
-            lines.append(f"All registered harness profiles: {', '.join(all_names)}")
+            lines.append("Do NOT pick any other profile name.")
     if ctx.skills:
         lines.append(f"Skills available: {', '.join(s.id or s.name for s in ctx.skills[:10])}")
     if ctx.capabilities:

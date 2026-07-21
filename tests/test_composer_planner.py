@@ -36,6 +36,24 @@ def _ctx(harness_names=None, skill_ids=None, caps=None):
     )
 
 
+def _ctx_harness(profiles, skill_ids=None, caps=None):
+    """Like _ctx but each entry is (name, runnable) so tests can
+    construct a mix of runnable and non-runnable profiles."""
+    from conductor.composer.models import (
+        CapabilityInfo,
+        HarnessProfileInfo,
+        SkillInfo,
+    )
+    return ComposerContext(
+        harness_profiles=[
+            HarnessProfileInfo(name=name, runnable=runnable)
+            for (name, runnable) in profiles
+        ],
+        skills=[SkillInfo(id=s) for s in (skill_ids or [])],
+        capabilities=[CapabilityInfo(capability=c, available=True) for c in (caps or [])],
+    )
+
+
 class TestValidatePlanResult:
     @pytest.fixture
     def valid_plan_result(self):
@@ -162,6 +180,34 @@ class TestValidatePlanResult:
         result = validate_plan_result(plan, ctx)
         assert not result.valid
         assert any("unknown harness" in e for e in result.errors)
+
+    def test_nonrunnable_harness_profile_rejected(self):
+        """A registered-but-not-runnable harness (binary missing on
+        AGW host) must be rejected so the LLM planner retries with the
+        repair plan and selects a runnable profile instead."""
+        plan = PlanResult(
+            tasks=[
+                LLMTaskNode(node_id="task_a",
+                             harness_profile="opencode-deepseek",
+                             verification=VerificationSpec(commands=[
+                                 VerificationCommand(name="t", command="t", required=True)])),
+                LLMTaskNode(node_id="task_b",
+                             harness_profile="pi-coding-agent",
+                             verification=VerificationSpec(commands=[
+                                 VerificationCommand(name="t", command="t", required=True)])),
+            ],
+            integration=LLMIntegrationNode(node_id="integration",
+                                           dependencies=["task_a", "task_b"]),
+        )
+        ctx = _ctx_harness(profiles=[
+            ("opencode-deepseek", False),
+            ("pi-coding-agent", True),
+        ])
+        result = validate_plan_result(plan, ctx)
+        assert not result.valid
+        assert any("non-runnable harness profile 'opencode-deepseek'" in e
+                   for e in result.errors)
+        assert any("pi-coding-agent" in e for e in result.errors)
 
     def test_unknown_skill(self):
         plan = PlanResult(

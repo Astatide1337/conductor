@@ -63,11 +63,19 @@ def validate_plan_result(
 
     # Harness profiles exist
     available_profiles = {p.name for p in context.harness_profiles}
+    runnable_profiles = {p.name for p in context.harness_profiles
+                          if p.runnable}
     for t in plan.tasks:
         if not t.harness_profile:
             errors.append(f"Task '{t.node_id}' has no harness_profile")
         elif available_profiles and t.harness_profile not in available_profiles:
             errors.append(f"Task '{t.node_id}' uses unknown harness profile '{t.harness_profile}'")
+        elif runnable_profiles and t.harness_profile not in runnable_profiles:
+            errors.append(
+                f"Task '{t.node_id}' uses non-runnable harness profile "
+                f"'{t.harness_profile}' (must be one of: "
+                f"{', '.join(sorted(runnable_profiles))})"
+            )
     if plan.integration and plan.integration.required:
         if not available_profiles or plan.integration.node_id not in available_profiles:
             # integration uses default profile — warn, not error
@@ -146,9 +154,17 @@ def validate_plan(plan: ComposerPlan, context: ComposerContext) -> PlanValidatio
     errors.extend(_check_dag_nodes(node_map))
 
     available_profiles = {p.name for p in context.harness_profiles}
+    runnable_profiles = {p.name for p in context.harness_profiles
+                         if p.runnable}
     for t in plan.tasks:
         if available_profiles and t.harness_profile and t.harness_profile not in available_profiles:
             errors.append(f"Task '{t.node_id}' uses unknown harness profile '{t.harness_profile}'")
+        elif runnable_profiles and t.harness_profile and t.harness_profile not in runnable_profiles:
+            errors.append(
+                f"Task '{t.node_id}' uses non-runnable harness profile "
+                f"'{t.harness_profile}' (must be one of: "
+                f"{', '.join(sorted(runnable_profiles))})"
+            )
 
     available_caps = {c.capability for c in context.capabilities if c.available}
     for t in plan.tasks:
