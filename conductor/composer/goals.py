@@ -77,7 +77,7 @@ def build_task_brief(
 def build_integration_brief(
     spec: NormalizedSpec,
     completed_tasks: list[TaskNode],
-    integration_profile: str = "opencode-deepseek",
+    integration_profile: str = "pi-coding-agent",
     base_branch: str = "master",
 ) -> str:
     """Build the goal text for the integration task."""

@@ -56,10 +56,10 @@ class TestBuildContext:
 
     def test_context_with_harness_profiles(self):
         gw = MockAgentsGatewayClient()
-        gw.register_harness_profile("opencode-deepseek")
+        gw.register_harness_profile("pi-coding-agent")
         ctx = build_composer_context("obj_1", None, agents_gateway_client=gw)
         assert len(ctx.harness_profiles) == 1
-        assert ctx.harness_profiles[0].name == "opencode-deepseek"
+        assert ctx.harness_profiles[0].name == "pi-coding-agent"
         assert ctx.harness_profiles[0].runnable is True
 
     def test_context_with_harness_profiles_unavailable(self):
@@ -110,12 +110,12 @@ class TestContextToPrompt:
     def test_with_harness(self):
         ctx = ComposerContext(
             harness_profiles=[
-                HarnessProfileInfo(name="opencode-deepseek", runnable=True),
+                HarnessProfileInfo(name="pi-coding-agent", runnable=True),
                 HarnessProfileInfo(name="disabled", runnable=False),
             ]
         )
         prompt = context_to_prompt(ctx)
-        assert "opencode-deepseek" in prompt
+        assert "pi-coding-agent" in prompt
         assert "disabled" not in prompt
 
     def test_with_skills(self):

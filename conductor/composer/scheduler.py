@@ -39,12 +39,14 @@ class Scheduler:
         max_parallel_tasks: int = 3,
         metrics=None,
         conductor_storage=None,
+        default_model: str = "",
     ) -> None:
         self.storage = storage
         self.agents_gateway = agents_gateway_client
         self.max_parallel_tasks = max_parallel_tasks
         self.metrics = metrics
         self.conductor_storage = conductor_storage
+        self.default_model = default_model
 
     def find_ready_nodes(self, plan: ComposerPlan) -> list[TaskNode]:
         """Find pending nodes whose dependencies are all completed."""
@@ -165,6 +167,7 @@ class Scheduler:
                 "runtime": "tmux",
                 "isolation": "worktree",
                 "harness_profile": node.harness_profile,
+                "model": node.model or self.default_model,
             },
             "goal": {
                 "strategy": "auto",

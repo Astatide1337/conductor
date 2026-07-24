@@ -127,6 +127,10 @@ class VerificationContract:
             if not is_required:
                 continue
 
+            pt_status = pt.get("status", "")
+            if pt_status != "completed":
+                continue
+
             gw_task_id = pt.get("agents_gateway_task_id")
             if not gw_task_id:
                 reasons.append(

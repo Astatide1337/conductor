@@ -37,7 +37,7 @@ def conductor_storage(db_path):
 def gw():
     client = MockAgentsGatewayClient()
     # Register default harness
-    client.register_harness_profile("opencode-deepseek", runnable=True)
+    client.register_harness_profile("pi-coding-agent", runnable=True)
     return client
 
 
@@ -181,7 +181,7 @@ class TestDispatchReadyTasks:
             tasks=[
                 TaskNode(
                     node_id="a",
-                    harness_profile="opencode-deepseek",
+                    harness_profile="pi-coding-agent",
                     title="Task A",
                     goal="Do A",
                     verification=VerificationSpec(
@@ -190,7 +190,7 @@ class TestDispatchReadyTasks:
                 ),
                 TaskNode(
                     node_id="b",
-                    harness_profile="opencode-deepseek",
+                    harness_profile="pi-coding-agent",
                     title="Task B",
                     goal="Do B",
                     verification=VerificationSpec(
@@ -216,12 +216,12 @@ class TestDispatchReadyTasks:
             id="plan_1", objective_id=obj["id"], spec_id="spec_1",
             tasks=[
                 TaskNode(
-                    node_id="a", harness_profile="opencode-deepseek",
+                    node_id="a", harness_profile="pi-coding-agent",
                     goal="A",
                     verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)]),
                 ),
                 TaskNode(
-                    node_id="b", harness_profile="opencode-deepseek",
+                    node_id="b", harness_profile="pi-coding-agent",
                     goal="B",
                     verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)]),
                 ),
@@ -239,13 +239,13 @@ class TestDispatchReadyTasks:
             id="plan_1", objective_id=obj["id"], spec_id="spec_1",
             tasks=[
                 TaskNode(
-                    node_id="a", harness_profile="opencode-deepseek",
+                    node_id="a", harness_profile="pi-coding-agent",
                     goal="A", status="running",
                     verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)]),
                 ),
                 TaskNode(
                     node_id="b", dependencies=["a"],
-                    harness_profile="opencode-deepseek",
+                    harness_profile="pi-coding-agent",
                     goal="B",
                     verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)]),
                 ),
@@ -264,12 +264,12 @@ class TestDispatchReadyTasks:
             id="plan_1", objective_id=obj["id"], spec_id="spec_1",
             tasks=[
                 TaskNode(
-                    node_id="a", file_scope=["src/"], harness_profile="opencode-deepseek",
+                    node_id="a", file_scope=["src/"], harness_profile="pi-coding-agent",
                     goal="A", status="running",
                     verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)]),
                 ),
                 TaskNode(
-                    node_id="b", file_scope=["src/"], harness_profile="opencode-deepseek",
+                    node_id="b", file_scope=["src/"], harness_profile="pi-coding-agent",
                     goal="B",
                     verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)]),
                 ),
@@ -286,7 +286,7 @@ class TestRestartFailedTask:
         from conductor.composer.models import ComposerPlan
         obj = conductor_storage.create_objective(title="Test")
         node = TaskNode(
-            node_id="a", harness_profile="opencode-deepseek",
+            node_id="a", harness_profile="pi-coding-agent",
             goal="Original goal",
             verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)]),
             status="failed",
@@ -314,7 +314,7 @@ class TestRestartFailedTask:
         from conductor.composer.models import ComposerPlan
         obj = conductor_storage.create_objective(title="Test")
         node = TaskNode(
-            node_id="a", harness_profile="opencode-deepseek",
+            node_id="a", harness_profile="pi-coding-agent",
             goal="Original",
             verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)]),
             status="failed",

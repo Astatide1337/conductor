@@ -37,7 +37,7 @@ def conductor_storage(db_path):
 @pytest.fixture
 def gw():
     client = MockAgentsGatewayClient()
-    client.register_harness_profile("opencode-deepseek")
+    client.register_harness_profile("pi-coding-agent")
     return client
 
 
@@ -45,7 +45,7 @@ def gw():
 def dispatcher(cstorage, gw, conductor_storage):
     return IntegrationDispatcher(
         cstorage, gw,
-        integration_harness_profile="opencode-deepseek",
+        integration_harness_profile="pi-coding-agent",
         conductor_storage=conductor_storage,
     )
 
@@ -99,7 +99,7 @@ class TestDispatchIntegration:
 
     def test_dispatch_integration_harness_not_runnable(self, cstorage, conductor_storage, objective_id):
         gw = MockAgentsGatewayClient()
-        gw.register_harness_profile("opencode-deepseek", runnable=False)
+        gw.register_harness_profile("pi-coding-agent", runnable=False)
         dispatcher = IntegrationDispatcher(cstorage, gw,
                                            conductor_storage=conductor_storage)
         spec = cstorage.create_spec(objective_id, "Test", "raw")

@@ -23,7 +23,8 @@ class IntegrationDispatcher:
         storage: ComposerStorage,
         agents_gateway_client,
         *,
-        integration_harness_profile: str = "opencode-deepseek",
+        integration_harness_profile: str = "pi-coding-agent",
+        integration_model: str = "",
         base_branch: str = "master",
         metrics=None,
         conductor_storage=None,
@@ -31,6 +32,7 @@ class IntegrationDispatcher:
         self.storage = storage
         self.agents_gateway = agents_gateway_client
         self.integration_profile = integration_harness_profile
+        self.integration_model = integration_model
         self.base_branch = base_branch
         self.metrics = metrics
         self.conductor_storage = conductor_storage
@@ -93,6 +95,7 @@ class IntegrationDispatcher:
                 "runtime": "tmux",
                 "isolation": "worktree",
                 "harness_profile": self.integration_profile,
+                "model": self.integration_model or "",
             },
             "goal": {
                 "strategy": "auto",

@@ -64,7 +64,7 @@ def setup():
         cfg.composer.report_dir = os.path.join(d, "reports")
         gw = MockAgentsGatewayClient()
         gw.register_agent("code-validator", "Code Validator")
-        gw.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        gw.register_harness_profile("pi-coding-agent", "OpenCode DeepSeek", runnable=True)
         reg = build_default_registry(cfg)
         svc = ComposerService(
             storage=cps, conductor_storage=cs,
@@ -426,7 +426,7 @@ class TestStrictVerification:
                     tasks=[
                         LLMTaskNode(
                             node_id="a",
-                            harness_profile="opencode-deepseek",
+                            harness_profile="pi-coding-agent",
                             verification=VS(
                                 required=True,
                                 commands=[VerificationCommand(
@@ -489,7 +489,7 @@ class TestStrictVerification:
                     tasks=[
                         LLMTaskNode(
                             node_id="a",
-                            harness_profile="opencode-deepseek",
+                            harness_profile="pi-coding-agent",
                             verification=VS(
                                 required=True,
                                 commands=[VerificationCommand(
@@ -571,7 +571,7 @@ class TestBlockedVerificationContract:
                     tasks=[
                         LLMTaskNode(
                             node_id="a",
-                            harness_profile="opencode-deepseek",
+                            harness_profile="pi-coding-agent",
                             verification=VS(
                                 required=True,
                                 commands=[VerificationCommand(
@@ -686,7 +686,7 @@ class TestBlockedVerificationContract:
                     tasks=[
                         LLMTaskNode(
                             node_id="a",
-                            harness_profile="opencode-deepseek",
+                            harness_profile="pi-coding-agent",
                             verification=VS(
                                 required=True,
                                 commands=[VerificationCommand(
@@ -965,7 +965,7 @@ class TestTransitionalStateRestart:
         cps2 = ComposerStorage(db)
         cps2.initialize()
         gw2 = MockAgentsGatewayClient()
-        gw2.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        gw2.register_harness_profile("pi-coding-agent", "OpenCode DeepSeek", runnable=True)
         reg2 = build_default_registry(cfg2)
         svc2 = ComposerService(
             storage=cps2, conductor_storage=cs,
@@ -1006,7 +1006,7 @@ class TestTransitionalStateRestart:
         cps2 = ComposerStorage(db)
         cps2.initialize()
         gw2 = MockAgentsGatewayClient()
-        gw2.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        gw2.register_harness_profile("pi-coding-agent", "OpenCode DeepSeek", runnable=True)
         reg2 = build_default_registry(cfg2)
         svc2 = ComposerService(
             storage=cps2, conductor_storage=cs,
@@ -1074,7 +1074,7 @@ class TestTransitionalStateRestart:
         cps2 = ComposerStorage(db)
         cps2.initialize()
         gw2 = MockAgentsGatewayClient()
-        gw2.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        gw2.register_harness_profile("pi-coding-agent", "OpenCode DeepSeek", runnable=True)
         reg2 = build_default_registry(cfg2)
         svc2 = ComposerService(
             storage=cps2, conductor_storage=cs,

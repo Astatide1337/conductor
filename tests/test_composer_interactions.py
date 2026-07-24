@@ -32,7 +32,7 @@ def conductor_storage(db_path):
 @pytest.fixture
 def gw():
     client = MockAgentsGatewayClient()
-    client.register_harness_profile("opencode-deepseek")
+    client.register_harness_profile("pi-coding-agent")
     return client
 
 

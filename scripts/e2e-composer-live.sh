@@ -479,7 +479,45 @@ for t in tasks:
     except Exception:
         pass
 print(f\"paths={len(set(paths))} branches={len(set(branches))}\")
-" 2>/dev/null || echo "paths=0 branches=0")
+" 2>/dev/null) || WT_RESULT="paths=0 branches=0"
+
+# The two implementation tasks dispatch staggered by tens of seconds;
+# the divide task's worktree record may not exist yet right after
+# `tasks dispatched`.  Retry the WT query a few times until both are
+# registered or we give up after ~3 minutes.
+WT_WAIT=0
+while ! echo "${WT_RESULT}" | grep -qE "paths=(2|3|4|5)"; do
+    if [[ "${WT_WAIT}" -ge 180 ]]; then
+        break
+    fi
+    sleep 15
+    WT_WAIT=$((WT_WAIT + 15))
+    WT_RESULT=$(echo "${R}" | python3 -c "
+import sys, json, os, urllib.request
+tasks = json.load(sys.stdin).get('tasks', [])
+gw_base = os.environ.get('CONDUCTOR_AGENTS_GATEWAY_URL', 'http://localhost:8092')
+gw_token = os.environ.get('CONDUCTOR_AGENTS_GATEWAY_INTERNAL_TOKEN', '')
+headers = {}
+if gw_token:
+    headers['X-Auth-Internal-Token'] = gw_token
+paths = []
+branches = []
+for t in tasks:
+    gw_id = t.get('agents_gateway_task_id', '')
+    if not gw_id:
+        continue
+    try:
+        req = urllib.request.Request(f'{gw_base}/tasks/{gw_id}/worktree', headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            paths.append(data.get('path', ''))
+            branches.append(data.get('branch', ''))
+    except Exception:
+        pass
+print(f\"paths={len(set(paths))} branches={len(set(branches))}\")
+" 2>/dev/null) || WT_RESULT="paths=0 branches=0"
+    echo "  worktree uniqueness: ${WT_RESULT} (after ${WT_WAIT}s)"
+done
 echo "  worktree uniqueness: ${WT_RESULT}"
 check_contains "at least 2 distinct worktree paths" "paths=2\|paths=3\|paths=4\|paths=5" "${WT_RESULT}"
 check_contains "at least 2 distinct branches" "branches=2\|branches=3\|branches=4\|branches=5" "${WT_RESULT}"

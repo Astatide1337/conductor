@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS composer_plan_tasks (
     ownership_notes TEXT NOT NULL DEFAULT '',
     dependencies_json TEXT NOT NULL DEFAULT '[]',
     file_scope_json TEXT NOT NULL DEFAULT '[]',
-    harness_profile TEXT NOT NULL DEFAULT 'opencode-deepseek',
+    harness_profile TEXT NOT NULL DEFAULT 'pi-coding-agent',
     required_skills_json TEXT NOT NULL DEFAULT '[]',
     required_capabilities_json TEXT NOT NULL DEFAULT '[]',
     verification_json TEXT NOT NULL DEFAULT '{}',
@@ -162,6 +162,7 @@ class ComposerStorage:
         ("composer_plan_tasks", "ownership_notes", "TEXT NOT NULL DEFAULT ''"),
         ("composer_plan_tasks", "previous_status", "TEXT"),
         ("composer_plan_tasks", "paused_at", "TEXT"),
+        ("composer_plan_tasks", "model", "TEXT NOT NULL DEFAULT ''"),
     ]
 
     def _apply_migrations(self, conn) -> None:
@@ -378,14 +379,14 @@ class ComposerStorage:
         ).fetchone()
         if existing:
             # Update existing task — preserve durable plan-node identity
-            # fields (title, goal, ownership_notes) unless caller supplies
-            # explicit overrides.
+            # fields (title, goal, ownership_notes, model) unless caller
+            # supplies explicit overrides.
             conn.execute(
                 """UPDATE composer_plan_tasks SET
                    conductor_task_id = ?, agents_gateway_task_id = ?,
                    task_type = ?, title = ?, goal = ?, ownership_notes = ?,
                    status = ?, branch = ?, commit_sha = ?,
-                   artifact_refs_json = ?, metadata_json = ?, updated_at = ?
+                   artifact_refs_json = ?, metadata_json = ?, model = ?, updated_at = ?
                    WHERE id = ?""",
                 (
                     task.get("conductor_task_id"),
@@ -399,6 +400,7 @@ class ComposerStorage:
                     task.get("commit_sha"),
                     json.dumps(task.get("artifact_refs", [])),
                     json.dumps(task.get("metadata", {})),
+                    task.get("model", ""),
                     now,
                     existing["id"],
                 ),
@@ -408,11 +410,11 @@ class ComposerStorage:
                 """INSERT INTO composer_plan_tasks
                    (id, plan_id, node_key, conductor_task_id, agents_gateway_task_id,
                     task_type, title, goal, ownership_notes,
-                    dependencies_json, file_scope_json, harness_profile,
+                    dependencies_json, file_scope_json, harness_profile, model,
                     required_skills_json, required_capabilities_json, verification_json,
                     status, branch, commit_sha, artifact_refs_json, metadata_json,
                     created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     f"ptask_{_uid()}", plan_id, node_key,
                     task.get("conductor_task_id"),
@@ -423,7 +425,8 @@ class ComposerStorage:
                     task.get("ownership_notes", ""),
                     json.dumps(task.get("dependencies", [])),
                     json.dumps(task.get("file_scope", [])),
-                    task.get("harness_profile", "opencode-deepseek"),
+                    task.get("harness_profile", "pi-coding-agent"),
+                    task.get("model", ""),
                     json.dumps(task.get("required_skills", [])),
                     json.dumps(task.get("required_capabilities", [])),
                     json.dumps(task.get("verification", {})),
@@ -670,6 +673,7 @@ class ComposerStorage:
             "dependencies": json.loads(row["dependencies_json"]),
             "file_scope": json.loads(row["file_scope_json"]),
             "harness_profile": row["harness_profile"],
+            "model": row["model"] if "model" in row.keys() else "",
             "required_skills": json.loads(row["required_skills_json"]),
             "required_capabilities": json.loads(row["required_capabilities_json"]),
             "verification": json.loads(row["verification_json"]),

@@ -55,13 +55,13 @@ def plan_with_tasks(cstorage, objective_id):
         tasks=[
             TaskNode(
                 node_id="task_a", title="Task A",
-                harness_profile="opencode-deepseek",
+                harness_profile="pi-coding-agent",
                 status="completed",
                 branch="composer/branch-a", commit_sha="sha_a_bandc1234",
             ),
             TaskNode(
                 node_id="task_b", title="Task B",
-                harness_profile="opencode-deepseek",
+                harness_profile="pi-coding-agent",
                 status="completed",
                 branch="composer/branch-b", commit_sha="sha_b_3f2e9876",
             ),
@@ -130,7 +130,7 @@ class TestReportGeneration:
         )
         html = open(result["html_artifact_ref"]).read()
         assert "Task Graph" in html
-        assert "opencode-deepseek" in html
+        assert "pi-coding-agent" in html
 
     def test_report_includes_verification_matrix(self, report_gen, cstorage, objective_id, plan_with_tasks):
         plan_dict = cstorage.get_plan_by_objective(objective_id)

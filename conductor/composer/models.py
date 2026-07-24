@@ -131,7 +131,11 @@ class TaskNode(BaseModel):
     dependencies: list[str] = []
     file_scope: list[str] = []
     ownership_notes: str = ""
-    harness_profile: str = "opencode-deepseek"
+    harness_profile: str = "pi-coding-agent"
+    # Optional model override passed to the harness via its
+    # model_arg_name flag (e.g. --model for PI, -m for opencode).
+    # Empty string means "use the profile's default_model".
+    model: str = ""
     required_skills: list[str] = []
     required_capabilities: list[str] = []
     verification: VerificationSpec = Field(default_factory=VerificationSpec)
@@ -159,6 +163,8 @@ class IntegrationNode(BaseModel):
     branch: str | None = None
     commit_sha: str | None = None
     harness_profile: str = "pi-coding-agent"
+    # Optional per-integration model override (see TaskNode.model).
+    model: str = ""
 
 
 class ComposerPlan(BaseModel):
@@ -184,7 +190,11 @@ class LLMTaskNode(BaseModel):
     dependencies: list[str] = []
     file_scope: list[str] = []
     ownership_notes: str = ""
-    harness_profile: str = "opencode-deepseek"
+    harness_profile: str = "pi-coding-agent"
+    # Optional model override (e.g. ``nvidia/nemotron-3-ultra-550b-a55b:free``).
+    # The planner LLM fills this in per task so the right model is
+    # passed to the harness for the job.
+    model: str = ""
     required_skills: list[str] = []
     required_capabilities: list[str] = []
     verification: VerificationSpec = Field(default_factory=VerificationSpec)

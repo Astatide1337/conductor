@@ -58,7 +58,8 @@ Return ONLY a JSON object matching this schema:
       "dependencies": [],
       "file_scope": ["path/to/files"],
       "ownership_notes": "...",
-      "harness_profile": "opencode-deepseek",
+      "harness_profile": "pi-coding-agent",
+      "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
       "required_skills": [],
       "required_capabilities": [],
       "verification": {{"required": true, "commands": [{{"name": "unit tests", "command": "uv run pytest -q", "required": true}}]}}
