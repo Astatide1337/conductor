@@ -192,9 +192,6 @@ class Scheduler:
                 ],
             },
         }
-        print(f"[E2E_SPEC] node={node.node_id} node.model={node.model!r} default_model={self.default_model!r} spec.exec.model={task_spec['execution']['model']!r}", flush=True)
-        with open('/tmp/conductor_dispatch.log', 'a') as f:
-            f.write(f"[E2E_SPEC] node={node.node_id} node.model={node.model!r} default_model={self.default_model!r} spec.exec.model={task_spec['execution']['model']!r}\n")
 
         try:
             gw_task = self.agents_gateway.create_harness_task(task_spec, idempotency_key=idem_key)

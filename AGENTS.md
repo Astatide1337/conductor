@@ -103,8 +103,11 @@ infra-conductor-1` suffices after edits — clear `__pycache__` first to
 avoid stale compile cache).
 
 If you change the bind-mount location or remove it altogether, this
-editable install is no longer needed.  TODO: bake `pip install -e .`
-into the Dockerfile so this manual step goes away.
+editable install is no longer needed. The Dockerfile does not bake
+`pip install -e .` because the bind-mount is a live-dev convenience,
+not a production code path; production deploys bake the package into
+the image via `pip install .` at build time (see `Dockerfile`) and do
+not bind-mount host source.
 
 ## Repo-specific pointers
 
