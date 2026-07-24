@@ -37,7 +37,7 @@ def e2e_setup():
         cfg.composer.report_dir = os.path.join(d, "reports")
         gw = MockAgentsGatewayClient()
         gw.register_agent("code-validator", "Code Validator")
-        gw.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        gw.register_harness_profile("pi-coding-agent", "OpenCode DeepSeek", runnable=True)
         reg = build_default_registry(cfg)
         llm = FakeComposerLLMClient()
         svc = ComposerService(
@@ -375,7 +375,7 @@ class TestComposerE2EFlow:
         cps2 = ComposerStorage(cs.db_path)
         cps2.initialize()
         gw2 = MockAgentsGatewayClient()
-        gw2.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        gw2.register_harness_profile("pi-coding-agent", "OpenCode DeepSeek", runnable=True)
         reg = build_default_registry(cfg)
         svc2 = ComposerService(
             storage=cps2, conductor_storage=cs,

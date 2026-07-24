@@ -257,7 +257,7 @@ class InteractionHandler:
                 dependencies=pt.get("dependencies", []),
                 file_scope=pt.get("file_scope", []),
                 ownership_notes=pt.get("ownership_notes", ""),
-                harness_profile=pt.get("harness_profile", "opencode-deepseek"),
+                harness_profile=pt.get("harness_profile", "pi-coding-agent"),
                 required_skills=pt.get("required_skills", []),
                 required_capabilities=pt.get("required_capabilities", []),
                 verification=VerificationSpec(

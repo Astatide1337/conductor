@@ -39,12 +39,14 @@ class Scheduler:
         max_parallel_tasks: int = 3,
         metrics=None,
         conductor_storage=None,
+        default_model: str = "",
     ) -> None:
         self.storage = storage
         self.agents_gateway = agents_gateway_client
         self.max_parallel_tasks = max_parallel_tasks
         self.metrics = metrics
         self.conductor_storage = conductor_storage
+        self.default_model = default_model
 
     def find_ready_nodes(self, plan: ComposerPlan) -> list[TaskNode]:
         """Find pending nodes whose dependencies are all completed."""
@@ -165,6 +167,7 @@ class Scheduler:
                 "runtime": "tmux",
                 "isolation": "worktree",
                 "harness_profile": node.harness_profile,
+                "model": node.model or self.default_model,
             },
             "goal": {
                 "strategy": "auto",
@@ -189,6 +192,9 @@ class Scheduler:
                 ],
             },
         }
+        print(f"[E2E_SPEC] node={node.node_id} node.model={node.model!r} default_model={self.default_model!r} spec.exec.model={task_spec['execution']['model']!r}", flush=True)
+        with open('/tmp/conductor_dispatch.log', 'a') as f:
+            f.write(f"[E2E_SPEC] node={node.node_id} node.model={node.model!r} default_model={self.default_model!r} spec.exec.model={task_spec['execution']['model']!r}\n")
 
         try:
             gw_task = self.agents_gateway.create_harness_task(task_spec, idempotency_key=idem_key)

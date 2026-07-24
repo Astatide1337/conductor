@@ -84,7 +84,7 @@ class TestPlanModels:
         assert t.title == ""
         assert t.task_type == "implementation"
         assert t.status == "pending"
-        assert t.harness_profile == "opencode-deepseek"
+        assert t.harness_profile == "pi-coding-agent"
         assert t.dependencies == []
         assert t.file_scope == []
         assert t.conductor_task_id is None
@@ -211,7 +211,7 @@ class TestContextModels:
         assert c.available is True
 
     def test_harness_profile_info(self):
-        h = HarnessProfileInfo(name="opencode-deepseek", runnable=True)
+        h = HarnessProfileInfo(name="pi-coding-agent", runnable=True)
         assert h.runnable is True
 
     def test_skill_info(self):

@@ -49,7 +49,7 @@ def mcp_state():
         cfg.composer.enabled = True
         gw = MockAgentsGatewayClient()
         gw.register_agent("code-validator", "Code Validator")
-        gw.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        gw.register_harness_profile("pi-coding-agent", "OpenCode DeepSeek", runnable=True)
         breaker = BreakerEvaluator(cs)
         reg = build_default_registry(cfg)
         composer_svc = ComposerService(

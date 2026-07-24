@@ -89,6 +89,7 @@ class ComposerService:
             max_parallel_tasks=self.config.max_parallel_tasks,
             metrics=metrics,
             conductor_storage=conductor_storage,
+            default_model=self.config.llm_model,
         )
         self.interaction_handler = InteractionHandler(
             storage, llm_client, agents_gateway_client, metrics=metrics,
@@ -99,6 +100,7 @@ class ComposerService:
             storage,
             agents_gateway_client,
             integration_harness_profile=self.config.integration_harness_profile,
+            integration_model=self.config.llm_model,
             metrics=metrics,
             conductor_storage=conductor_storage,
         )
@@ -360,6 +362,7 @@ class ComposerService:
                 file_scope=t.file_scope,
                 ownership_notes=t.ownership_notes,
                 harness_profile=t.harness_profile,
+                model=t.model,
                 required_skills=t.required_skills,
                 required_capabilities=t.required_capabilities,
                 verification=t.verification,
@@ -375,6 +378,7 @@ class ComposerService:
             dependencies=plan_result.integration.dependencies,
             verification=plan_result.integration.verification,
             harness_profile=self.config.integration_harness_profile,
+            model=self.config.llm_model,
         )
 
         plan = ComposerPlan(
@@ -1050,6 +1054,7 @@ class ComposerService:
                     commit_sha=pt.get("commit_sha"),
                     harness_profile=pt.get("harness_profile")
                         or self.config.integration_harness_profile,
+                    model=pt.get("model", "") or self.config.llm_model,
                 )
             else:
                 tasks.append(TaskNode(
@@ -1060,7 +1065,9 @@ class ComposerService:
                     dependencies=pt.get("dependencies", []),
                     file_scope=pt.get("file_scope", []),
                     ownership_notes=pt.get("ownership_notes", ""),
-                    harness_profile=pt.get("harness_profile", "opencode-deepseek"),
+                    harness_profile=pt.get("harness_profile")
+                        or self.config.default_harness_profile,
+                    model=pt.get("model", "") or self.config.llm_model,
                     required_skills=pt.get("required_skills", []),
                     required_capabilities=pt.get("required_capabilities", []),
                     verification=vs,

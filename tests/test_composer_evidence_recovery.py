@@ -48,7 +48,7 @@ def setup():
         cfg.composer.report_dir = os.path.join(d, "reports")
         gw = MockAgentsGatewayClient()
         gw.register_agent("code-validator", "Code Validator")
-        gw.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        gw.register_harness_profile("pi-coding-agent", "OpenCode DeepSeek", runnable=True)
         reg = build_default_registry(cfg)
         svc = ComposerService(
             storage=cps, conductor_storage=cs,
@@ -113,8 +113,8 @@ class TestPlanRepair:
                     return PlanResult(
                         summary="bad",
                         tasks=[
-                            LLMTaskNode(node_id="a", dependencies=["b"], harness_profile="opencode-deepseek"),
-                            LLMTaskNode(node_id="b", dependencies=["a"], harness_profile="opencode-deepseek"),
+                            LLMTaskNode(node_id="a", dependencies=["b"], harness_profile="pi-coding-agent"),
+                            LLMTaskNode(node_id="b", dependencies=["a"], harness_profile="pi-coding-agent"),
                         ],
                         integration=LLMIntegrationNode(required=True, dependencies=["a", "b"]),
                     )
@@ -145,8 +145,8 @@ class TestPlanRepair:
                     return PlanResult(
                         summary="cycle plan",
                         tasks=[
-                            LLMTaskNode(node_id="a", dependencies=["b"], harness_profile="opencode-deepseek"),
-                            LLMTaskNode(node_id="b", dependencies=["a"], harness_profile="opencode-deepseek"),
+                            LLMTaskNode(node_id="a", dependencies=["b"], harness_profile="pi-coding-agent"),
+                            LLMTaskNode(node_id="b", dependencies=["a"], harness_profile="pi-coding-agent"),
                         ],
                         integration=LLMIntegrationNode(required=True, dependencies=["a", "b"]),
                     )
@@ -177,7 +177,7 @@ class TestPlanRepair:
                         tasks=[
                             LLMTaskNode(node_id="a", harness_profile="nonexistent-harness",
                                        verification=VerificationSpec(required=True, commands=[])),
-                            LLMTaskNode(node_id="b", harness_profile="opencode-deepseek",
+                            LLMTaskNode(node_id="b", harness_profile="pi-coding-agent",
                                        verification=VerificationSpec(required=True, commands=[])),
                         ],
                         integration=LLMIntegrationNode(required=True, dependencies=["a", "b"]),
@@ -207,7 +207,7 @@ class TestPlanRepair:
                     return PlanResult(
                         summary="no verif",
                         tasks=[
-                            LLMTaskNode(node_id="a", harness_profile="opencode-deepseek",
+                            LLMTaskNode(node_id="a", harness_profile="pi-coding-agent",
                                        verification=VerificationSpec(required=True, commands=[])),
                         ],
                         integration=LLMIntegrationNode(required=True, dependencies=["a"]),
@@ -357,7 +357,7 @@ class TestRestartReconstruction:
         cfg2.composer.report_dir = os.path.join(d, "reports2")
         cps2 = ComposerStorage(db); cps2.initialize()
         gw2 = MockAgentsGatewayClient()
-        gw2.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        gw2.register_harness_profile("pi-coding-agent", "OpenCode DeepSeek", runnable=True)
         reg2 = build_default_registry(cfg2)
         svc2 = ComposerService(
             storage=cps2, conductor_storage=cs,
@@ -386,7 +386,7 @@ class TestRestartReconstruction:
         cfg2.composer.report_dir = os.path.join(d, "reports2")
         cps2 = ComposerStorage(db); cps2.initialize()
         gw2 = MockAgentsGatewayClient()
-        gw2.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        gw2.register_harness_profile("pi-coding-agent", "OpenCode DeepSeek", runnable=True)
         reg2 = build_default_registry(cfg2)
         svc2 = ComposerService(
             storage=cps2, conductor_storage=cs,

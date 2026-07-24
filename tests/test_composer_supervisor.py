@@ -26,7 +26,7 @@ def setup():
         cfg = ConductorConfig(environment="test", storage={"sqlite_path": db})
         gw = MockAgentsGatewayClient()
         gw.register_agent("code-validator", "Code Validator")
-        gw.register_harness_profile("opencode-deepseek", "OpenCode DeepSeek", runnable=True)
+        gw.register_harness_profile("pi-coding-agent", "OpenCode DeepSeek", runnable=True)
         reg = build_default_registry(cfg)
         svc = ComposerService(
             storage=cps, conductor_storage=cs,

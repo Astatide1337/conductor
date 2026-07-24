@@ -29,7 +29,7 @@ def _ctx(harness_names=None, skill_ids=None, caps=None):
     )
     return ComposerContext(
         harness_profiles=[
-            HarnessProfileInfo(name=n, runnable=True) for n in (harness_names or ["opencode-deepseek"])
+            HarnessProfileInfo(name=n, runnable=True) for n in (harness_names or ["pi-coding-agent"])
         ],
         skills=[SkillInfo(id=s) for s in (skill_ids or [])],
         capabilities=[CapabilityInfo(capability=c, available=True) for c in (caps or [])],
@@ -63,7 +63,7 @@ class TestValidatePlanResult:
                 LLMTaskNode(
                     node_id="task_api",
                     title="API",
-                    harness_profile="opencode-deepseek",
+                    harness_profile="pi-coding-agent",
                     verification=VerificationSpec(
                         required=True,
                         commands=[VerificationCommand(name="tests", command="uv run pytest", required=True)],
@@ -72,7 +72,7 @@ class TestValidatePlanResult:
                 LLMTaskNode(
                     node_id="task_db",
                     title="DB",
-                    harness_profile="opencode-deepseek",
+                    harness_profile="pi-coding-agent",
                     verification=VerificationSpec(
                         required=True,
                         commands=[VerificationCommand(name="tests", command="uv run pytest", required=True)],
@@ -99,9 +99,9 @@ class TestValidatePlanResult:
     def test_duplicate_node_ids(self):
         plan = PlanResult(
             tasks=[
-                LLMTaskNode(node_id="dup", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="dup", harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
-                LLMTaskNode(node_id="dup", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="dup", harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=LLMIntegrationNode(node_id="integration"),
@@ -125,7 +125,7 @@ class TestValidatePlanResult:
         plan = PlanResult(
             tasks=[
                 LLMTaskNode(node_id="task_a", dependencies=["nonexistent"],
-                             harness_profile="opencode-deepseek",
+                             harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=LLMIntegrationNode(node_id="integration", dependencies=["task_a"]),
@@ -139,7 +139,7 @@ class TestValidatePlanResult:
         plan = PlanResult(
             tasks=[
                 LLMTaskNode(node_id="task_a", dependencies=["task_a"],
-                             harness_profile="opencode-deepseek",
+                             harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=LLMIntegrationNode(node_id="integration", dependencies=["task_a"]),
@@ -153,10 +153,10 @@ class TestValidatePlanResult:
         plan = PlanResult(
             tasks=[
                 LLMTaskNode(node_id="a", dependencies=["b"],
-                             harness_profile="opencode-deepseek",
+                             harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
                 LLMTaskNode(node_id="b", dependencies=["a"],
-                             harness_profile="opencode-deepseek",
+                             harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=LLMIntegrationNode(node_id="integration", dependencies=["a", "b"]),
@@ -171,12 +171,12 @@ class TestValidatePlanResult:
             tasks=[
                 LLMTaskNode(node_id="task_a", harness_profile="unknown-profile",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
-                LLMTaskNode(node_id="task_b", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="task_b", harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=LLMIntegrationNode(node_id="integration", dependencies=["task_a", "task_b"]),
         )
-        ctx = _ctx(harness_names=["opencode-deepseek"])
+        ctx = _ctx(harness_names=["pi-coding-agent"])
         result = validate_plan_result(plan, ctx)
         assert not result.valid
         assert any("unknown harness" in e for e in result.errors)
@@ -188,11 +188,11 @@ class TestValidatePlanResult:
         plan = PlanResult(
             tasks=[
                 LLMTaskNode(node_id="task_a",
-                             harness_profile="opencode-deepseek",
+                             harness_profile="acme-busy",
                              verification=VerificationSpec(commands=[
                                  VerificationCommand(name="t", command="t", required=True)])),
                 LLMTaskNode(node_id="task_b",
-                             harness_profile="pi-coding-agent",
+                             harness_profile="acme-ready",
                              verification=VerificationSpec(commands=[
                                  VerificationCommand(name="t", command="t", required=True)])),
             ],
@@ -200,22 +200,22 @@ class TestValidatePlanResult:
                                            dependencies=["task_a", "task_b"]),
         )
         ctx = _ctx_harness(profiles=[
-            ("opencode-deepseek", False),
-            ("pi-coding-agent", True),
+            ("acme-busy", False),
+            ("acme-ready", True),
         ])
         result = validate_plan_result(plan, ctx)
         assert not result.valid
-        assert any("non-runnable harness profile 'opencode-deepseek'" in e
+        assert any("non-runnable harness profile 'acme-busy'" in e
                    for e in result.errors)
-        assert any("pi-coding-agent" in e for e in result.errors)
+        assert any("acme-ready" in e for e in result.errors)
 
     def test_unknown_skill(self):
         plan = PlanResult(
             tasks=[
-                LLMTaskNode(node_id="task_a", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="task_a", harness_profile="pi-coding-agent",
                              required_skills=["unknown-skill"],
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
-                LLMTaskNode(node_id="task_b", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="task_b", harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=LLMIntegrationNode(node_id="integration", dependencies=["task_a", "task_b"]),
@@ -228,10 +228,10 @@ class TestValidatePlanResult:
     def test_unavailable_capability(self):
         plan = PlanResult(
             tasks=[
-                LLMTaskNode(node_id="task_a", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="task_a", harness_profile="pi-coding-agent",
                              required_capabilities=["missing.cap"],
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
-                LLMTaskNode(node_id="task_b", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="task_b", harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=LLMIntegrationNode(node_id="integration", dependencies=["task_a", "task_b"]),
@@ -244,9 +244,9 @@ class TestValidatePlanResult:
     def test_required_verification_no_commands(self):
         plan = PlanResult(
             tasks=[
-                LLMTaskNode(node_id="task_a", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="task_a", harness_profile="pi-coding-agent",
                              verification=VerificationSpec(required=True, commands=[])),
-                LLMTaskNode(node_id="task_b", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="task_b", harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=LLMIntegrationNode(node_id="integration", dependencies=["task_a", "task_b"]),
@@ -259,7 +259,7 @@ class TestValidatePlanResult:
     def test_warning_few_implementation_tasks(self):
         plan = PlanResult(
             tasks=[
-                LLMTaskNode(node_id="task_only", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="task_only", harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=LLMIntegrationNode(node_id="integration", dependencies=["task_only"]),
@@ -272,9 +272,9 @@ class TestValidatePlanResult:
     def test_warning_integration_missing_dependency(self):
         plan = PlanResult(
             tasks=[
-                LLMTaskNode(node_id="task_a", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="task_a", harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
-                LLMTaskNode(node_id="task_b", harness_profile="opencode-deepseek",
+                LLMTaskNode(node_id="task_b", harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=LLMIntegrationNode(node_id="integration", dependencies=["task_a"]),
@@ -288,10 +288,10 @@ class TestValidatePlanResult:
         plan = PlanResult(
             tasks=[
                 LLMTaskNode(node_id="task_a", file_scope=["src/"],
-                             harness_profile="opencode-deepseek",
+                             harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
                 LLMTaskNode(node_id="task_b", file_scope=["src/"],
-                             harness_profile="opencode-deepseek",
+                             harness_profile="pi-coding-agent",
                              verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=LLMIntegrationNode(node_id="integration", dependencies=["task_a", "task_b"]),
@@ -336,9 +336,9 @@ class TestValidatePlan:
             objective_id="obj_1",
             spec_id="spec_1",
             tasks=[
-                TaskNode(node_id="a", harness_profile="opencode-deepseek",
+                TaskNode(node_id="a", harness_profile="pi-coding-agent",
                           verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
-                TaskNode(node_id="b", harness_profile="opencode-deepseek",
+                TaskNode(node_id="b", harness_profile="pi-coding-agent",
                           verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=IntegrationNode(dependencies=["a", "b"]),
@@ -354,10 +354,10 @@ class TestValidatePlan:
             spec_id="spec_1",
             tasks=[
                 TaskNode(node_id="a", dependencies=["b"],
-                          harness_profile="opencode-deepseek",
+                          harness_profile="pi-coding-agent",
                           verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
                 TaskNode(node_id="b", dependencies=["a"],
-                          harness_profile="opencode-deepseek",
+                          harness_profile="pi-coding-agent",
                           verification=VerificationSpec(commands=[VerificationCommand(name="t", command="t", required=True)])),
             ],
             integration=IntegrationNode(dependencies=["a", "b"]),
